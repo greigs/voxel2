@@ -6,7 +6,6 @@ from pyvox.parser import VoxParser
 from pyvox.writer import VoxWriter
 from stl import mesh
 import os
-from skimage.measure import marching_cubes # ADDED: For Marching Cubes
 
 CUTOUT_SIZE = 1 # Size of the cube to cut from each surface at the scaled resolution
 
@@ -263,42 +262,68 @@ def save_vox_file(filepath, voxel_data_bool, original_palette):
     writer.write()
 
 def save_stl_file(filepath, voxel_data_bool):
-    """Converts boolean voxel data to an STL mesh using Marching Cubes and saves it."""
-    if np.sum(voxel_data_bool) == 0:
+    """Converts boolean voxel data to an STL mesh by creating cubes for each voxel and saves it."""
+    if not np.any(voxel_data_bool):
         print(f"No voxels to save to STL file '{filepath}'. Skipping.")
         return
 
-    # Convert boolean voxel data to float for marching_cubes. Pad to avoid issues at boundaries.
-    # Marching cubes expects values, so True becomes 1.0 and False becomes 0.0.
-    # Padding ensures that surfaces on the edge of the volume are closed.
-    data_float = np.pad(voxel_data_bool.astype(float), pad_width=1, mode='constant', constant_values=0.0)
+    x_coords, y_coords, z_coords = np.where(voxel_data_bool)
+    num_voxels = len(x_coords)
 
-    # Apply marching cubes to extract surface
-    # level=0.5 is appropriate for binary data (0s and 1s)
-    # spacing ensures the model is scaled correctly if voxels aren't unit cubes (default is 1,1,1)
-    try:
-        verts, faces, normals, values = marching_cubes(data_float, level=0.5, spacing=(1.0, 1.0, 1.0))
-    except Exception as e:
-        if "No surfaces found" in str(e) or "isolevel" in str(e).lower(): # skimage specific error messages
-             print(f"Warning: Marching cubes found no surfaces in '{filepath}' (possibly empty or too sparse after processing). Skipping STL generation.")
-             return
-        raise # Re-raise other exceptions
-
-    if verts.size == 0 or faces.size == 0:
-        print(f"Warning: Marching cubes resulted in an empty mesh for '{filepath}'. Skipping STL generation.")
+    if num_voxels == 0:
+        print(f"No voxels to save to STL file '{filepath}'. Skipping.")
         return
 
-    # Adjust vertices due to padding: subtract 1 from all coordinates
-    verts -= 1
+    # Each voxel cube has 6 faces, each face 2 triangles = 12 triangles
+    # Create the mesh object with the correct number of faces (triangles)
+    stl_mesh_obj = mesh.Mesh(np.zeros(num_voxels * 12, dtype=mesh.Mesh.dtype))
+    
+    triangle_idx = 0
+    for i in range(num_voxels):
+        vx, vy, vz = float(x_coords[i]), float(y_coords[i]), float(z_coords[i])
 
-    # Create the STL mesh object
-    stl_mesh = mesh.Mesh(np.zeros(faces.shape[0], dtype=mesh.Mesh.dtype))
-    for i, f in enumerate(faces):
-        for j in range(3): # For each vertex in the face
-            stl_mesh.vectors[i][j] = verts[f[j], :]
-            
-    stl_mesh.save(filepath)
-    print(f"Saved STL file to '{filepath}' using Marching Cubes.")
+        # Define the 8 vertices of the cube for voxel (vx, vy, vz)
+        v = [
+            (vx, vy, vz),           # 0: bottom-left-front
+            (vx + 1, vy, vz),       # 1: bottom-right-front
+            (vx + 1, vy + 1, vz),   # 2: bottom-right-back
+            (vx, vy + 1, vz),       # 3: bottom-left-back
+            (vx, vy, vz + 1),       # 4: top-left-front
+            (vx + 1, vy, vz + 1),   # 5: top-right-front
+            (vx + 1, vy + 1, vz + 1), # 6: top-right-back
+            (vx, vy + 1, vz + 1)    # 7: top-left-back
+        ]
+
+        # Define the 12 triangles (2 per face), ensuring counter-clockwise winding for outward normals
+        
+        # Bottom face (-Z normal)
+        stl_mesh_obj.vectors[triangle_idx]     = [v[0], v[2], v[1]]
+        stl_mesh_obj.vectors[triangle_idx + 1] = [v[0], v[3], v[2]]
+        
+        # Top face (+Z normal)
+        stl_mesh_obj.vectors[triangle_idx + 2] = [v[4], v[5], v[6]]
+        stl_mesh_obj.vectors[triangle_idx + 3] = [v[4], v[6], v[7]]
+        
+        # Front face (-Y normal)
+        stl_mesh_obj.vectors[triangle_idx + 4] = [v[0], v[1], v[5]]
+        stl_mesh_obj.vectors[triangle_idx + 5] = [v[0], v[5], v[4]]
+        
+        # Back face (+Y normal)
+        stl_mesh_obj.vectors[triangle_idx + 6] = [v[3], v[2], v[6]]
+        stl_mesh_obj.vectors[triangle_idx + 7] = [v[3], v[6], v[7]]
+        
+        # Left face (-X normal)
+        stl_mesh_obj.vectors[triangle_idx + 8] = [v[0], v[4], v[7]]
+        stl_mesh_obj.vectors[triangle_idx + 9] = [v[0], v[7], v[3]]
+        
+        # Right face (+X normal)
+        stl_mesh_obj.vectors[triangle_idx + 10] = [v[1], v[5], v[6]]
+        stl_mesh_obj.vectors[triangle_idx + 11] = [v[1], v[6], v[2]]
+        
+        triangle_idx += 12
+
+    stl_mesh_obj.save(filepath)
+    print(f"Saved blocky STL file to '{filepath}' with {num_voxels} voxels ({num_voxels*12} triangles).")
 
 
 def main():
@@ -436,26 +461,29 @@ def main():
         else:
             print(f"No cutout voxels to save for '{output_cutouts_vox_path}' and '{output_cutouts_stl_path}'.")
 
-        print(f"\\nProcessing complete for \'{input_path}\'.")
+        print(f"\nProcessing complete for '{input_path}'.")
         print(f"Output .vox: {output_vox_path}")
         print(f"Output .stl: {output_stl_path}")
         if np.any(scaled_voxel_data):
             print(f"Output Scaled .vox: {output_scaled_vox_path}")
             print(f"Output Scaled .stl: {output_scaled_stl_path}")
+            
         if np.any(cutout_voxels_to_save):
             print(f"Output Cutouts .vox: {output_cutouts_vox_path}")
             print(f"Output Cutouts .stl: {output_cutouts_stl_path}")
+            
 
     except ImportError as e:
         print(f"Error: A required Python package is missing: {e}")
         print("Please ensure you have installed all dependencies:")
-        print("pip install numpy scipy py-vox-io numpy-stl scikit-image") # MODIFIED: Added scikit-image
-    except FileNotFoundError: # Should be caught by os.path.exists, but good practice
-        print(f"Error: Input file '{input_path}' not found during processing.")
+        print("pip install numpy scipy py-vox-io numpy-stl")
+    except FileNotFoundError:
+        print(f"Error: Input file '{input_path}' not found during processing.")    
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
         import traceback
         traceback.print_exc()
+        
 
 if __name__ == "__main__":
     main()
