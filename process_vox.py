@@ -8,6 +8,8 @@ from stl import mesh
 import os
 from skimage.measure import marching_cubes # ADDED: For Marching Cubes
 
+CUTOUT_SIZE = 2 # Size of the cube to cut from each surface at the scaled resolution
+
 def scale_voxels(voxel_data_bool, scale_factor):
     """Scales the voxel data by a given factor."""
     # order=0 for nearest-neighbor interpolation, suitable for binary voxel data
@@ -22,6 +24,128 @@ def erode_voxels(voxel_data_bool, erosion_voxels):
     struct = generate_binary_structure(3, 3) 
     eroded_data = binary_erosion(voxel_data_bool, structure=struct, iterations=erosion_voxels) # CORRECTED: voxel_data_bool, erosion_voxels
     return eroded_data
+
+def apply_surface_cutouts(original_voxels_bool, scaled_voxels_bool, scale_factor_int, cutout_dim):
+    """
+    For each voxel in original_voxels_bool, if it has an exposed surface,
+    cut out a (cutout_dim x cutout_dim x cutout_dim) cube from the corresponding
+    position on its surface in the scaled_voxels_bool.
+    Assumes scale_factor_int is the integer factor used for scaling.
+    Returns two arrays: the modified scaled data, and an array of only the cutout voxels.
+    """
+    if not original_voxels_bool.any() or not scaled_voxels_bool.any() or scale_factor_int <= 0 or cutout_dim <= 0:
+        return scaled_voxels_bool.copy(), np.zeros_like(scaled_voxels_bool, dtype=bool)
+
+    modified_scaled_data = scaled_voxels_bool.copy()
+    cutouts_only_data = np.zeros_like(scaled_voxels_bool, dtype=bool) # To store only the voxels that are cut out
+
+    sm_dx, sm_dy, sm_dz = original_voxels_bool.shape
+    sc_dx, sc_dy, sc_dz = scaled_voxels_bool.shape # Dimensions of the scaled array
+
+    SF = scale_factor_int # Alias for brevity
+    # Offset to center the cutout_dim block within an SF-sized segment
+    offset = (SF // 2) - (cutout_dim // 2)
+
+    for smx in range(sm_dx):
+        for smy in range(sm_dy):
+            for smz in range(sm_dz):
+                if not original_voxels_bool[smx, smy, smz]:
+                    continue
+
+                # Define centered slices for the other two dimensions when a face is on X, Y, or Z plane
+                
+                # For X-face cutouts, Y and Z are centered on the smallxel's scaled footprint
+                y_centered_start_on_x_face = smy * SF + offset
+                y_centered_end_on_x_face = y_centered_start_on_x_face + cutout_dim
+                z_centered_start_on_x_face = smz * SF + offset
+                z_centered_end_on_x_face = z_centered_start_on_x_face + cutout_dim
+                
+                y_slice_for_x_face = slice(max(0, y_centered_start_on_x_face), min(sc_dy, y_centered_end_on_x_face))
+                z_slice_for_x_face = slice(max(0, z_centered_start_on_x_face), min(sc_dz, z_centered_end_on_x_face))
+
+                # For Y-face cutouts, X and Z are centered
+                x_centered_start_on_y_face = smx * SF + offset
+                x_centered_end_on_y_face = x_centered_start_on_y_face + cutout_dim
+                # z_centered_start/end_on_y_face is same as z_centered_start/end_on_x_face
+                
+                x_slice_for_y_face = slice(max(0, x_centered_start_on_y_face), min(sc_dx, x_centered_end_on_y_face))
+                z_slice_for_y_face = z_slice_for_x_face # Same Z centering logic
+
+                # For Z-face cutouts, X and Y are centered
+                # x_centered_start/end_on_z_face is same as x_centered_start/end_on_y_face
+                # y_centered_start/end_on_z_face is same as y_centered_start/end_on_x_face
+
+                x_slice_for_z_face = x_slice_for_y_face # Same X centering logic
+                y_slice_for_z_face = y_slice_for_x_face # Same Y centering logic
+
+                # Check and process -X face of smallxel (smx,smy,smz)
+                if smx == 0 or not original_voxels_bool[smx - 1, smy, smz]:
+                    x_surf_start = smx * SF
+                    x_surf_end = x_surf_start + cutout_dim
+                    current_x_slice = slice(max(0, x_surf_start), min(sc_dx, x_surf_end))
+                    if current_x_slice.start < current_x_slice.stop and y_slice_for_x_face.start < y_slice_for_x_face.stop and z_slice_for_x_face.start < z_slice_for_x_face.stop:
+                        # Record the voxels to be cut before actually cutting them
+                        region_to_cut = (current_x_slice, y_slice_for_x_face, z_slice_for_x_face)
+                        cutouts_only_data[region_to_cut] = np.logical_and(cutouts_only_data[region_to_cut], True) # Keep existing cutouts if overlap
+                        cutouts_only_data[region_to_cut] = np.logical_or(cutouts_only_data[region_to_cut], modified_scaled_data[region_to_cut])
+                        modified_scaled_data[region_to_cut] = False
+                
+                # Check and process +X face
+                if smx == sm_dx - 1 or not original_voxels_bool[smx + 1, smy, smz]:
+                    x_surf_start = (smx + 1) * SF - cutout_dim
+                    x_surf_end = (smx + 1) * SF
+                    current_x_slice = slice(max(0, x_surf_start), min(sc_dx, x_surf_end))
+                    if current_x_slice.start < current_x_slice.stop and y_slice_for_x_face.start < y_slice_for_x_face.stop and z_slice_for_x_face.start < z_slice_for_x_face.stop:
+                        region_to_cut = (current_x_slice, y_slice_for_x_face, z_slice_for_x_face)
+                        cutouts_only_data[region_to_cut] = np.logical_and(cutouts_only_data[region_to_cut], True)
+                        cutouts_only_data[region_to_cut] = np.logical_or(cutouts_only_data[region_to_cut], modified_scaled_data[region_to_cut])
+                        modified_scaled_data[region_to_cut] = False
+
+                # Check and process -Y face
+                if smy == 0 or not original_voxels_bool[smx, smy - 1, smz]:
+                    y_surf_start = smy * SF
+                    y_surf_end = y_surf_start + cutout_dim
+                    current_y_slice = slice(max(0, y_surf_start), min(sc_dy, y_surf_end))
+                    if x_slice_for_y_face.start < x_slice_for_y_face.stop and current_y_slice.start < current_y_slice.stop and z_slice_for_y_face.start < z_slice_for_y_face.stop:
+                        region_to_cut = (x_slice_for_y_face, current_y_slice, z_slice_for_y_face)
+                        cutouts_only_data[region_to_cut] = np.logical_and(cutouts_only_data[region_to_cut], True)
+                        cutouts_only_data[region_to_cut] = np.logical_or(cutouts_only_data[region_to_cut], modified_scaled_data[region_to_cut])
+                        modified_scaled_data[region_to_cut] = False
+
+                # Check and process +Y face
+                if smy == sm_dy - 1 or not original_voxels_bool[smx, smy + 1, smz]:
+                    y_surf_start = (smy + 1) * SF - cutout_dim
+                    y_surf_end = (smy + 1) * SF
+                    current_y_slice = slice(max(0, y_surf_start), min(sc_dy, y_surf_end))
+                    if x_slice_for_y_face.start < x_slice_for_y_face.stop and current_y_slice.start < current_y_slice.stop and z_slice_for_y_face.start < z_slice_for_y_face.stop:
+                        region_to_cut = (x_slice_for_y_face, current_y_slice, z_slice_for_y_face)
+                        cutouts_only_data[region_to_cut] = np.logical_and(cutouts_only_data[region_to_cut], True)
+                        cutouts_only_data[region_to_cut] = np.logical_or(cutouts_only_data[region_to_cut], modified_scaled_data[region_to_cut])
+                        modified_scaled_data[region_to_cut] = False
+                
+                # Check and process -Z face
+                if smz == 0 or not original_voxels_bool[smx, smy, smz - 1]:
+                    z_surf_start = smz * SF
+                    z_surf_end = z_surf_start + cutout_dim
+                    current_z_slice = slice(max(0, z_surf_start), min(sc_dz, z_surf_end))
+                    if x_slice_for_z_face.start < x_slice_for_z_face.stop and y_slice_for_z_face.start < y_slice_for_z_face.stop and current_z_slice.start < current_z_slice.stop:
+                        region_to_cut = (x_slice_for_z_face, y_slice_for_z_face, current_z_slice)
+                        cutouts_only_data[region_to_cut] = np.logical_and(cutouts_only_data[region_to_cut], True)
+                        cutouts_only_data[region_to_cut] = np.logical_or(cutouts_only_data[region_to_cut], modified_scaled_data[region_to_cut])
+                        modified_scaled_data[region_to_cut] = False
+
+                # Check and process +Z face
+                if smz == sm_dz - 1 or not original_voxels_bool[smx, smy, smz + 1]:
+                    z_surf_start = (smz + 1) * SF - cutout_dim
+                    z_surf_end = (smz + 1) * SF
+                    current_z_slice = slice(max(0, z_surf_start), min(sc_dz, z_surf_end))
+                    if x_slice_for_z_face.start < x_slice_for_z_face.stop and y_slice_for_z_face.start < y_slice_for_z_face.stop and current_z_slice.start < current_z_slice.stop:
+                        region_to_cut = (x_slice_for_z_face, y_slice_for_z_face, current_z_slice)
+                        cutouts_only_data[region_to_cut] = np.logical_and(cutouts_only_data[region_to_cut], True)
+                        cutouts_only_data[region_to_cut] = np.logical_or(cutouts_only_data[region_to_cut], modified_scaled_data[region_to_cut])
+                        modified_scaled_data[region_to_cut] = False
+                        
+    return modified_scaled_data, cutouts_only_data
 
 def save_vox_file(filepath, voxel_data_bool, original_palette):
     """Saves the boolean voxel data to a .vox file, clipping if dimensions exceed 255."""
@@ -139,6 +263,8 @@ def main():
 
     output_vox_path = os.path.join(output_dir, f"{base_name}_processed.vox")
     output_stl_path = os.path.join(output_dir, f"{base_name}_processed.stl")
+    output_cutouts_vox_path = os.path.join(output_dir, f"{base_name}_cutouts.vox")
+    output_cutouts_stl_path = os.path.join(output_dir, f"{base_name}_cutouts.stl")
 
     try:
         print(f"Loading \'{input_path}\'...")
@@ -184,12 +310,40 @@ def main():
         scaled_voxel_data = scale_voxels(initial_voxel_data_bool, scale_factor)
         print(f"Scaled dimensions: {scaled_voxel_data.shape}")
 
+        # Apply surface cutouts
+        int_sf = int(round(scale_factor))
+        data_for_erosion = scaled_voxel_data # Default to scaled_voxel_data
+        cutout_voxels_to_save = np.zeros_like(scaled_voxel_data, dtype=bool) # Initialize empty cutouts
+
+        if initial_voxel_data_bool.any() and scaled_voxel_data.any() and int_sf > 0 and CUTOUT_SIZE > 0:
+            num_voxels_before_cutout = np.sum(scaled_voxel_data)
+            print(f"Applying {CUTOUT_SIZE}x{CUTOUT_SIZE}x{CUTOUT_SIZE} surface cutouts from original smallxel surfaces (using effective scale factor {int_sf})...")
+            data_for_erosion, cutout_voxels_to_save = apply_surface_cutouts(
+                initial_voxel_data_bool,
+                scaled_voxel_data,
+                int_sf,
+                CUTOUT_SIZE
+            )
+            num_voxels_after_cutout = np.sum(data_for_erosion)
+            print(f"Dimensions after cutouts: {data_for_erosion.shape}") # Shape should not change
+            if num_voxels_after_cutout == num_voxels_before_cutout:
+                 print("Note: Cutout process did not remove any additional voxels (e.g., no exposed surfaces, cutouts fell outside, or target areas already empty).")
+            else:
+                 print(f"Note: Cutout process removed {num_voxels_before_cutout - num_voxels_after_cutout} voxels.")
+        else:
+            if not (initial_voxel_data_bool.any() and scaled_voxel_data.any()):
+                print("Skipping surface cutouts as initial or scaled model is empty.")
+            elif int_sf <= 0:
+                print(f"Skipping surface cutouts as integer scale factor ({int_sf}) is not positive.")
+            elif CUTOUT_SIZE <= 0:
+                print(f"Skipping surface cutouts as CUTOUT_SIZE ({CUTOUT_SIZE}) is not positive.")
+        
         if erosion_amount > 0:
             print(f"Eroding by {erosion_amount} voxel layers...")
-            processed_voxel_data = erode_voxels(scaled_voxel_data, erosion_amount)
+            processed_voxel_data = erode_voxels(data_for_erosion, erosion_amount)
             print(f"Dimensions after erosion: {processed_voxel_data.shape}")
         else:
-            processed_voxel_data = scaled_voxel_data # Skip erosion
+            processed_voxel_data = data_for_erosion # Skip erosion
             print("Skipping erosion step as erosion_amount is 0 or less.")
         
         if np.sum(processed_voxel_data) == 0:
@@ -201,9 +355,20 @@ def main():
         print(f"Saving processed model as .stl file to '{output_stl_path}'...")
         save_stl_file(output_stl_path, processed_voxel_data)
 
+        if np.any(cutout_voxels_to_save):
+            print(f"Saving cutout voxels to .vox file: '{output_cutouts_vox_path}'...")
+            save_vox_file(output_cutouts_vox_path, cutout_voxels_to_save, original_palette)
+            print(f"Saving cutout voxels as .stl file: '{output_cutouts_stl_path}'...")
+            save_stl_file(output_cutouts_stl_path, cutout_voxels_to_save)
+        else:
+            print(f"No cutout voxels to save for '{output_cutouts_vox_path}' and '{output_cutouts_stl_path}'.")
+
         print(f"\\nProcessing complete for \'{input_path}\'.")
         print(f"Output .vox: {output_vox_path}")
         print(f"Output .stl: {output_stl_path}")
+        if np.any(cutout_voxels_to_save):
+            print(f"Output Cutouts .vox: {output_cutouts_vox_path}")
+            print(f"Output Cutouts .stl: {output_cutouts_stl_path}")
 
     except ImportError as e:
         print(f"Error: A required Python package is missing: {e}")
