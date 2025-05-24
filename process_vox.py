@@ -8,7 +8,7 @@ from stl import mesh
 import os
 from skimage.measure import marching_cubes # ADDED: For Marching Cubes
 
-CUTOUT_SIZE = 2 # Size of the cube to cut from each surface at the scaled resolution
+CUTOUT_SIZE = 1 # Size of the cube to cut from each surface at the scaled resolution
 
 def scale_voxels(voxel_data_bool, scale_factor):
     """
@@ -132,10 +132,14 @@ def apply_surface_cutouts(original_voxels_bool, scaled_voxels_bool, scale_factor
                     x_surf_end = x_surf_start + cutout_dim
                     current_x_slice = slice(max(0, x_surf_start), min(sc_dx, x_surf_end))
                     if current_x_slice.start < current_x_slice.stop and y_slice_for_x_face.start < y_slice_for_x_face.stop and z_slice_for_x_face.start < z_slice_for_x_face.stop:
-                        # Record the voxels to be cut before actually cutting them
                         region_to_cut = (current_x_slice, y_slice_for_x_face, z_slice_for_x_face)
-                        cutouts_only_data[region_to_cut] = np.logical_and(cutouts_only_data[region_to_cut], True) # Keep existing cutouts if overlap
-                        cutouts_only_data[region_to_cut] = np.logical_or(cutouts_only_data[region_to_cut], modified_scaled_data[region_to_cut])
+                        # Update cutouts_only_data: mark voxels in the current region_to_cut as True
+                        # if they are solid in modified_scaled_data (before this cut) OR
+                        # if they were already marked as cut from a previous overlapping operation.
+                        cutouts_only_data[region_to_cut] = np.logical_or(
+                            cutouts_only_data[region_to_cut],
+                            modified_scaled_data[region_to_cut]
+                        )
                         modified_scaled_data[region_to_cut] = False
                 
                 # Check and process +X face
@@ -145,8 +149,10 @@ def apply_surface_cutouts(original_voxels_bool, scaled_voxels_bool, scale_factor
                     current_x_slice = slice(max(0, x_surf_start), min(sc_dx, x_surf_end))
                     if current_x_slice.start < current_x_slice.stop and y_slice_for_x_face.start < y_slice_for_x_face.stop and z_slice_for_x_face.start < z_slice_for_x_face.stop:
                         region_to_cut = (current_x_slice, y_slice_for_x_face, z_slice_for_x_face)
-                        cutouts_only_data[region_to_cut] = np.logical_and(cutouts_only_data[region_to_cut], True)
-                        cutouts_only_data[region_to_cut] = np.logical_or(cutouts_only_data[region_to_cut], modified_scaled_data[region_to_cut])
+                        cutouts_only_data[region_to_cut] = np.logical_or(
+                            cutouts_only_data[region_to_cut],
+                            modified_scaled_data[region_to_cut]
+                        )
                         modified_scaled_data[region_to_cut] = False
 
                 # Check and process -Y face
@@ -156,8 +162,10 @@ def apply_surface_cutouts(original_voxels_bool, scaled_voxels_bool, scale_factor
                     current_y_slice = slice(max(0, y_surf_start), min(sc_dy, y_surf_end))
                     if x_slice_for_y_face.start < x_slice_for_y_face.stop and current_y_slice.start < current_y_slice.stop and z_slice_for_y_face.start < z_slice_for_y_face.stop:
                         region_to_cut = (x_slice_for_y_face, current_y_slice, z_slice_for_y_face)
-                        cutouts_only_data[region_to_cut] = np.logical_and(cutouts_only_data[region_to_cut], True)
-                        cutouts_only_data[region_to_cut] = np.logical_or(cutouts_only_data[region_to_cut], modified_scaled_data[region_to_cut])
+                        cutouts_only_data[region_to_cut] = np.logical_or(
+                            cutouts_only_data[region_to_cut],
+                            modified_scaled_data[region_to_cut]
+                        )
                         modified_scaled_data[region_to_cut] = False
 
                 # Check and process +Y face
@@ -167,8 +175,10 @@ def apply_surface_cutouts(original_voxels_bool, scaled_voxels_bool, scale_factor
                     current_y_slice = slice(max(0, y_surf_start), min(sc_dy, y_surf_end))
                     if x_slice_for_y_face.start < x_slice_for_y_face.stop and current_y_slice.start < current_y_slice.stop and z_slice_for_y_face.start < z_slice_for_y_face.stop:
                         region_to_cut = (x_slice_for_y_face, current_y_slice, z_slice_for_y_face)
-                        cutouts_only_data[region_to_cut] = np.logical_and(cutouts_only_data[region_to_cut], True)
-                        cutouts_only_data[region_to_cut] = np.logical_or(cutouts_only_data[region_to_cut], modified_scaled_data[region_to_cut])
+                        cutouts_only_data[region_to_cut] = np.logical_or(
+                            cutouts_only_data[region_to_cut],
+                            modified_scaled_data[region_to_cut]
+                        )
                         modified_scaled_data[region_to_cut] = False
                 
                 # Check and process -Z face
@@ -178,8 +188,10 @@ def apply_surface_cutouts(original_voxels_bool, scaled_voxels_bool, scale_factor
                     current_z_slice = slice(max(0, z_surf_start), min(sc_dz, z_surf_end))
                     if x_slice_for_z_face.start < x_slice_for_z_face.stop and y_slice_for_z_face.start < y_slice_for_z_face.stop and current_z_slice.start < current_z_slice.stop:
                         region_to_cut = (x_slice_for_z_face, y_slice_for_z_face, current_z_slice)
-                        cutouts_only_data[region_to_cut] = np.logical_and(cutouts_only_data[region_to_cut], True)
-                        cutouts_only_data[region_to_cut] = np.logical_or(cutouts_only_data[region_to_cut], modified_scaled_data[region_to_cut])
+                        cutouts_only_data[region_to_cut] = np.logical_or(
+                            cutouts_only_data[region_to_cut],
+                            modified_scaled_data[region_to_cut]
+                        )
                         modified_scaled_data[region_to_cut] = False
 
                 # Check and process +Z face
@@ -189,8 +201,10 @@ def apply_surface_cutouts(original_voxels_bool, scaled_voxels_bool, scale_factor
                     current_z_slice = slice(max(0, z_surf_start), min(sc_dz, z_surf_end))
                     if x_slice_for_z_face.start < x_slice_for_z_face.stop and y_slice_for_z_face.start < y_slice_for_z_face.stop and current_z_slice.start < current_z_slice.stop:
                         region_to_cut = (x_slice_for_z_face, y_slice_for_z_face, current_z_slice)
-                        cutouts_only_data[region_to_cut] = np.logical_and(cutouts_only_data[region_to_cut], True)
-                        cutouts_only_data[region_to_cut] = np.logical_or(cutouts_only_data[region_to_cut], modified_scaled_data[region_to_cut])
+                        cutouts_only_data[region_to_cut] = np.logical_or(
+                            cutouts_only_data[region_to_cut],
+                            modified_scaled_data[region_to_cut]
+                        )
                         modified_scaled_data[region_to_cut] = False
                         
     return modified_scaled_data, cutouts_only_data
