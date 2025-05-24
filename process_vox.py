@@ -265,6 +265,8 @@ def main():
     output_stl_path = os.path.join(output_dir, f"{base_name}_processed.stl")
     output_cutouts_vox_path = os.path.join(output_dir, f"{base_name}_cutouts.vox")
     output_cutouts_stl_path = os.path.join(output_dir, f"{base_name}_cutouts.stl")
+    output_scaled_vox_path = os.path.join(output_dir, f"{base_name}_scaled.vox") # New path for scaled .vox
+    output_scaled_stl_path = os.path.join(output_dir, f"{base_name}_scaled.stl") # New path for scaled .stl
 
     try:
         print(f"Loading \'{input_path}\'...")
@@ -309,6 +311,15 @@ def main():
         print(f"Scaling by {scale_factor}x...")
         scaled_voxel_data = scale_voxels(initial_voxel_data_bool, scale_factor)
         print(f"Scaled dimensions: {scaled_voxel_data.shape}")
+
+        # Save the scaled data before cutouts or erosion
+        if np.any(scaled_voxel_data):
+            print(f"Saving scaled .vox file to '{output_scaled_vox_path}'...")
+            save_vox_file(output_scaled_vox_path, scaled_voxel_data, original_palette)
+            print(f"Saving scaled model as .stl file to '{output_scaled_stl_path}'...")
+            save_stl_file(output_scaled_stl_path, scaled_voxel_data)
+        else:
+            print(f"Skipping save of scaled model as it is empty ('{output_scaled_vox_path}', '{output_scaled_stl_path}').")
 
         # Apply surface cutouts
         int_sf = int(round(scale_factor))
@@ -366,6 +377,9 @@ def main():
         print(f"\\nProcessing complete for \'{input_path}\'.")
         print(f"Output .vox: {output_vox_path}")
         print(f"Output .stl: {output_stl_path}")
+        if np.any(scaled_voxel_data):
+            print(f"Output Scaled .vox: {output_scaled_vox_path}")
+            print(f"Output Scaled .stl: {output_scaled_stl_path}")
         if np.any(cutout_voxels_to_save):
             print(f"Output Cutouts .vox: {output_cutouts_vox_path}")
             print(f"Output Cutouts .stl: {output_cutouts_stl_path}")
