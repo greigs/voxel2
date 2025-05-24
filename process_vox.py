@@ -72,6 +72,24 @@ def erode_voxels(voxel_data_bool, erosion_voxels):
     eroded_data = binary_erosion(voxel_data_bool, structure=struct, iterations=erosion_voxels) # CORRECTED: voxel_data_bool, erosion_voxels
     return eroded_data
 
+def crop_voxel_data(voxel_data_bool):
+    """Crops the voxel data to the smallest bounding box containing all True voxels."""
+    if not np.any(voxel_data_bool):
+        # If the array is all False, return an empty array with the same number of dimensions
+        # or the original array, depending on desired behavior for completely empty inputs.
+        # Returning a (0,0,0) shape for consistency with how empty models might be handled.
+        return np.zeros((0, 0, 0), dtype=bool)
+
+    true_indices = np.argwhere(voxel_data_bool)
+    if true_indices.size == 0:
+        return np.zeros((0,0,0), dtype=bool) # Should be caught by np.any above, but as a safeguard
+
+    x_min, y_min, z_min = true_indices.min(axis=0)
+    x_max, y_max, z_max = true_indices.max(axis=0)
+
+    cropped_data = voxel_data_bool[x_min:x_max+1, y_min:y_max+1, z_min:z_max+1]
+    return cropped_data
+
 def apply_surface_cutouts(original_voxels_bool, scaled_voxels_bool, scale_factor_int, cutout_dim):
     """
     For each voxel in original_voxels_bool, if it has an exposed surface,
@@ -261,8 +279,9 @@ def save_vox_file(filepath, voxel_data_bool, original_palette):
     writer = VoxWriter(filepath, vox_container_to_save)
     writer.write()
 
-def save_stl_file(filepath, voxel_data_bool):
-    """Converts boolean voxel data to an STL mesh by creating cubes for each voxel and saves it.
+def save_stl_file(filepath, voxel_data_bool, output_voxel_size_mm=1.0):
+    """Converts boolean voxel data to an STL mesh and saves it.
+    Each voxel in voxel_data_bool is represented as a cube of side length output_voxel_size_mm.
     Only external faces are included to create a hollow mesh.
     """
     if not np.any(voxel_data_bool):
@@ -274,23 +293,27 @@ def save_stl_file(filepath, voxel_data_bool):
     # List to store all the triangles for the external faces
     all_triangles = []
 
+    s = float(output_voxel_size_mm) # size of one voxel in mm
+
     for x in range(dx):
         for y in range(dy):
             for z in range(dz):
                 if voxel_data_bool[x, y, z]:
                     # This is a solid voxel, check its 6 faces
-                    vx, vy, vz = float(x), float(y), float(z)
+                    # Calculate base coordinates for this voxel, scaled by output_voxel_size_mm
+                    base_x, base_y, base_z = float(x) * s, float(y) * s, float(z) * s
                     
-                    # Define the 8 vertices of the cube for voxel (vx, vy, vz)
+                    # Define the 8 vertices of the cube for voxel (x, y, z)
+                    # scaled by output_voxel_size_mm
                     v = [
-                        (vx, vy, vz),           # 0: bottom-left-front
-                        (vx + 1, vy, vz),       # 1: bottom-right-front
-                        (vx + 1, vy + 1, vz),   # 2: bottom-right-back
-                        (vx, vy + 1, vz),       # 3: bottom-left-back
-                        (vx, vy, vz + 1),       # 4: top-left-front
-                        (vx + 1, vy, vz + 1),   # 5: top-right-front
-                        (vx + 1, vy + 1, vz + 1), # 6: top-right-back
-                        (vx, vy + 1, vz + 1)    # 7: top-left-back
+                        (base_x, base_y, base_z),                     # 0: bottom-left-front
+                        (base_x + s, base_y, base_z),                 # 1: bottom-right-front
+                        (base_x + s, base_y + s, base_z),             # 2: bottom-right-back
+                        (base_x, base_y + s, base_z),                 # 3: bottom-left-back
+                        (base_x, base_y, base_z + s),                 # 4: top-left-front
+                        (base_x + s, base_y, base_z + s),             # 5: top-right-front
+                        (base_x + s, base_y + s, base_z + s),         # 6: top-right-back
+                        (base_x, base_y + s, base_z + s)              # 7: top-left-back
                     ]
 
                     # Check -X face (left)
@@ -335,7 +358,10 @@ def save_stl_file(filepath, voxel_data_bool):
     
     stl_mesh_obj.save(filepath)
     num_voxels = np.sum(voxel_data_bool)
-    print(f"Saved hollow STL file to '{filepath}' with {num_voxels} voxels ({num_triangles} triangles representing external faces).")
+    dim_x_mm = dx * s
+    dim_y_mm = dy * s
+    dim_z_mm = dz * s
+    print(f"Saved hollow STL file to '{filepath}' with {num_voxels} voxels ({num_triangles} triangles representing external faces). Each voxel is {s}mm sided. STL dimensions: {dim_x_mm:.2f}mm x {dim_y_mm:.2f}mm x {dim_z_mm:.2f}mm.")
 
 
 def main():
@@ -367,8 +393,10 @@ def main():
     output_scaled_vox_path = os.path.join(output_dir, f"{base_name}_scaled.vox") # New path for scaled .vox
     output_scaled_stl_path = os.path.join(output_dir, f"{base_name}_scaled.stl") # New path for scaled .stl
 
+    STL_VOXEL_SIZE_MM = 1.25 # Define the desired size for voxels in STL output
+
     try:
-        print(f"Loading \'{input_path}\'...")
+        print(f"Loading '{input_path}'...")
         vox_data_container = VoxParser(input_path).parse()
 
         if not vox_data_container.models:
@@ -416,7 +444,7 @@ def main():
             print(f"Saving scaled .vox file to '{output_scaled_vox_path}'...")
             save_vox_file(output_scaled_vox_path, scaled_voxel_data, original_palette)
             print(f"Saving scaled model as .stl file to '{output_scaled_stl_path}'...")
-            save_stl_file(output_scaled_stl_path, scaled_voxel_data)
+            save_stl_file(output_scaled_stl_path, scaled_voxel_data, output_voxel_size_mm=STL_VOXEL_SIZE_MM)
         else:
             print(f"Skipping save of scaled model as it is empty ('{output_scaled_vox_path}', '{output_scaled_stl_path}').")
 
@@ -450,8 +478,14 @@ def main():
         
         if erosion_amount > 0:
             print(f"Eroding by {erosion_amount} voxel layers...")
-            processed_voxel_data = erode_voxels(data_for_erosion, erosion_amount)
-            print(f"Dimensions after erosion: {processed_voxel_data.shape}")
+            processed_voxel_data_eroded = erode_voxels(data_for_erosion, erosion_amount)
+            print(f"Dimensions after erosion (before crop): {processed_voxel_data_eroded.shape}")
+            if np.any(processed_voxel_data_eroded):
+                processed_voxel_data = crop_voxel_data(processed_voxel_data_eroded)
+                print(f"Dimensions after cropping to content: {processed_voxel_data.shape}")
+            else:
+                processed_voxel_data = processed_voxel_data_eroded # Already empty or all False
+                print(f"Skipping crop as data is empty after erosion.")
         else:
             processed_voxel_data = data_for_erosion # Skip erosion
             print("Skipping erosion step as erosion_amount is 0 or less.")
@@ -463,13 +497,13 @@ def main():
         save_vox_file(output_vox_path, processed_voxel_data, original_palette)
 
         print(f"Saving processed model as .stl file to '{output_stl_path}'...")
-        save_stl_file(output_stl_path, processed_voxel_data)
+        save_stl_file(output_stl_path, processed_voxel_data, output_voxel_size_mm=STL_VOXEL_SIZE_MM)
 
         if np.any(cutout_voxels_to_save):
             print(f"Saving cutout voxels to .vox file: '{output_cutouts_vox_path}'...")
             save_vox_file(output_cutouts_vox_path, cutout_voxels_to_save, original_palette)
             print(f"Saving cutout voxels as .stl file: '{output_cutouts_stl_path}'...")
-            save_stl_file(output_cutouts_stl_path, cutout_voxels_to_save)
+            save_stl_file(output_cutouts_stl_path, cutout_voxels_to_save, output_voxel_size_mm=STL_VOXEL_SIZE_MM)
         else:
             print(f"No cutout voxels to save for '{output_cutouts_vox_path}' and '{output_cutouts_stl_path}'.")
 
@@ -477,10 +511,6 @@ def main():
         print(f"Output .vox: {output_vox_path}")
         print(f"Output .stl: {output_stl_path}")
         if np.any(scaled_voxel_data):
-            print(f"Output Scaled .vox: {output_scaled_vox_path}")
-            print(f"Output Scaled .stl: {output_scaled_stl_path}")
-            
-        if np.any(cutout_voxels_to_save):
             print(f"Output Cutouts .vox: {output_cutouts_vox_path}")
             print(f"Output Cutouts .stl: {output_cutouts_stl_path}")
             
