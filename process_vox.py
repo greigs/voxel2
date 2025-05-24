@@ -11,10 +11,58 @@ from skimage.measure import marching_cubes # ADDED: For Marching Cubes
 CUTOUT_SIZE = 2 # Size of the cube to cut from each surface at the scaled resolution
 
 def scale_voxels(voxel_data_bool, scale_factor):
-    """Scales the voxel data by a given factor."""
-    # order=0 for nearest-neighbor interpolation, suitable for binary voxel data
-    scaled_data = zoom(voxel_data_bool, scale_factor, order=0) # CORRECTED: voxel_data_bool, scale_factor
-    return scaled_data.astype(bool)
+    """
+    Scales the voxel data by ensuring each original voxel becomes a solid
+    sf_int x sf_int x sf_int block, where sf_int is the rounded integer scale_factor.
+    """
+    if not voxel_data_bool.any() or scale_factor <= 0:
+        # If input is empty or scale factor is non-positive,
+        # return an empty array or handle as appropriate.
+        # For simplicity, if scale_factor is non-positive, treat as no scaling or empty.
+        # Or, more robustly, calculate scaled shape even if empty.
+        if scale_factor <= 0:
+            sf_int = 0
+        else:
+            sf_int = int(round(scale_factor))
+            if sf_int <= 0: # Handles cases like scale_factor = 0.1 rounding to 0
+                sf_int = 0
+        
+        orig_dx, orig_dy, orig_dz = voxel_data_bool.shape
+        scaled_shape = (orig_dx * sf_int, orig_dy * sf_int, orig_dz * sf_int)
+        return np.zeros(scaled_shape, dtype=bool)
+
+    sf_int = int(round(scale_factor))
+    if sf_int <= 0: # e.g. scale_factor was < 0.5 and rounded to 0
+        orig_dx, orig_dy, orig_dz = voxel_data_bool.shape
+        return np.zeros((orig_dx * 0, orig_dy * 0, orig_dz * 0), dtype=bool)
+
+
+    orig_dx, orig_dy, orig_dz = voxel_data_bool.shape
+    
+    # Calculate new dimensions
+    scaled_dx = orig_dx * sf_int
+    scaled_dy = orig_dy * sf_int
+    scaled_dz = orig_dz * sf_int
+
+    # Create the new scaled array, initialized to False
+    scaled_data_bool = np.zeros((scaled_dx, scaled_dy, scaled_dz), dtype=bool)
+
+    for x_orig in range(orig_dx):
+        for y_orig in range(orig_dy):
+            for z_orig in range(orig_dz):
+                if voxel_data_bool[x_orig, y_orig, z_orig]:
+                    # This voxel is True, so create a block in the scaled array
+                    x_start_scaled = x_orig * sf_int
+                    y_start_scaled = y_orig * sf_int
+                    z_start_scaled = z_orig * sf_int
+                    
+                    scaled_data_bool[
+                        x_start_scaled : x_start_scaled + sf_int,
+                        y_start_scaled : y_start_scaled + sf_int,
+                        z_start_scaled : z_start_scaled + sf_int
+                    ] = True
+    
+    return scaled_data_bool
 
 def erode_voxels(voxel_data_bool, erosion_voxels):
     """Erodes the voxel data using a 3x3x3 structuring element."""
