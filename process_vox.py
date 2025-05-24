@@ -73,22 +73,22 @@ def erode_voxels(voxel_data_bool, erosion_voxels):
     return eroded_data
 
 def crop_voxel_data(voxel_data_bool):
-    """Crops the voxel data to the smallest bounding box containing all True voxels."""
+    """Crops the voxel data to the smallest bounding box containing all True voxels.
+    Returns the cropped data, and the min coordinates (x_min, y_min, z_min) of the crop.
+    Returns an empty array and None for coords if input is empty.
+    """
     if not np.any(voxel_data_bool):
-        # If the array is all False, return an empty array with the same number of dimensions
-        # or the original array, depending on desired behavior for completely empty inputs.
-        # Returning a (0,0,0) shape for consistency with how empty models might be handled.
-        return np.zeros((0, 0, 0), dtype=bool)
+        return np.zeros((0, 0, 0), dtype=bool), None
 
     true_indices = np.argwhere(voxel_data_bool)
-    if true_indices.size == 0:
-        return np.zeros((0,0,0), dtype=bool) # Should be caught by np.any above, but as a safeguard
+    if true_indices.size == 0: # Should be caught by np.any, but as a safeguard
+        return np.zeros((0,0,0), dtype=bool), None
 
     x_min, y_min, z_min = true_indices.min(axis=0)
     x_max, y_max, z_max = true_indices.max(axis=0)
 
     cropped_data = voxel_data_bool[x_min:x_max+1, y_min:y_max+1, z_min:z_max+1]
-    return cropped_data
+    return cropped_data, (x_min, y_min, z_min)
 
 def apply_surface_cutouts(original_voxels_bool, scaled_voxels_bool, scale_factor_int, cutout_dim):
     """
@@ -225,6 +225,122 @@ def apply_surface_cutouts(original_voxels_bool, scaled_voxels_bool, scale_factor
                         modified_scaled_data[region_to_cut] = False
                         
     return modified_scaled_data, cutouts_only_data
+
+def generate_triangles_for_voxel_block(voxel_data_bool, output_voxel_size_mm, global_offset_mm):
+    """Generates STL triangles for a block of voxels with a global offset."""
+    if not np.any(voxel_data_bool):
+        return []
+
+    dx, dy, dz = voxel_data_bool.shape
+    s = float(output_voxel_size_mm)
+    offset_x, offset_y, offset_z = global_offset_mm
+    
+    block_triangles = []
+
+    for x_local in range(dx):
+        for y_local in range(dy):
+            for z_local in range(dz):
+                if voxel_data_bool[x_local, y_local, z_local]:
+                    base_vx = offset_x + float(x_local) * s
+                    base_vy = offset_y + float(y_local) * s
+                    base_vz = offset_z + float(z_local) * s
+                    
+                    v = [
+                        (base_vx,    base_vy,    base_vz),                     # 0
+                        (base_vx + s,base_vy,    base_vz),                 # 1
+                        (base_vx + s,base_vy + s,base_vz),             # 2
+                        (base_vx,    base_vy + s,base_vz),                 # 3
+                        (base_vx,    base_vy,    base_vz + s),             # 4
+                        (base_vx + s,base_vy,    base_vz + s),             # 5
+                        (base_vx + s,base_vy + s,base_vz + s),         # 6
+                        (base_vx,    base_vy + s,base_vz + s)              # 7
+                    ]
+
+                    # -X face
+                    if x_local == 0 or not voxel_data_bool[x_local - 1, y_local, z_local]:
+                        block_triangles.append([v[0], v[4], v[7]])
+                        block_triangles.append([v[0], v[7], v[3]])
+                    # +X face
+                    if x_local == dx - 1 or not voxel_data_bool[x_local + 1, y_local, z_local]:
+                        block_triangles.append([v[1], v[2], v[6]])
+                        block_triangles.append([v[1], v[6], v[5]])
+                    # -Y face
+                    if y_local == 0 or not voxel_data_bool[x_local, y_local - 1, z_local]:
+                        block_triangles.append([v[0], v[1], v[5]])
+                        block_triangles.append([v[0], v[5], v[4]])
+                    # +Y face
+                    if y_local == dy - 1 or not voxel_data_bool[x_local, y_local + 1, z_local]:
+                        block_triangles.append([v[3], v[7], v[6]])
+                        block_triangles.append([v[3], v[6], v[2]])
+                    # -Z face
+                    if z_local == 0 or not voxel_data_bool[x_local, y_local, z_local - 1]:
+                        block_triangles.append([v[0], v[2], v[1]])
+                        block_triangles.append([v[0], v[3], v[2]])
+                    # +Z face
+                    if z_local == dz - 1 or not voxel_data_bool[x_local, y_local, z_local + 1]:
+                        block_triangles.append([v[4], v[5], v[6]])
+                        block_triangles.append([v[4], v[6], v[7]])
+    return block_triangles
+
+def save_gapped_difference_stl(filepath, 
+                               original_smallxels_bool, 
+                               overall_difference_voxels_scaled, 
+                               scale_factor_int, 
+                               stl_voxel_size_mm, 
+                               gap_mm):
+    """Saves an STL of objects from difference_voxels, gapped by original grid."""
+    if not np.any(overall_difference_voxels_scaled) or not np.any(original_smallxels_bool):
+        print(f"No difference voxels or original voxels to process for '{filepath}'. Skipping.")
+        return False # Indicate no file saved
+
+    sm_dx, sm_dy, sm_dz = original_smallxels_bool.shape
+    SF = scale_factor_int
+    S_vmm = stl_voxel_size_mm
+
+    all_final_triangles = []
+    total_objects = 0
+
+    for smx in range(sm_dx):
+        for smy in range(sm_dy):
+            for smz in range(sm_dz):
+                if not original_smallxels_bool[smx, smy, smz]:
+                    continue
+
+                sub_diff_block = overall_difference_voxels_scaled[
+                    smx*SF : (smx+1)*SF,
+                    smy*SF : (smy+1)*SF,
+                    smz*SF : (smz+1)*SF
+                ]
+
+                if not np.any(sub_diff_block):
+                    continue
+                
+                total_objects += 1
+
+                block_origin_x_mm = smx * (SF * S_vmm + gap_mm)
+                block_origin_y_mm = smy * (SF * S_vmm + gap_mm)
+                block_origin_z_mm = smz * (SF * S_vmm + gap_mm)
+                current_block_global_offset_mm = (block_origin_x_mm, block_origin_y_mm, block_origin_z_mm)
+
+                object_triangles = generate_triangles_for_voxel_block(
+                    sub_diff_block,
+                    S_vmm,
+                    current_block_global_offset_mm
+                )
+                all_final_triangles.extend(object_triangles)
+
+    if not all_final_triangles:
+        print(f"No actual mesh objects to save in '{filepath}' after processing differences. Skipping.")
+        return False # Indicate no file saved
+
+    num_triangles = len(all_final_triangles)
+    final_mesh_obj = mesh.Mesh(np.zeros(num_triangles, dtype=mesh.Mesh.dtype))
+    for i, triangle_vertices in enumerate(all_final_triangles):
+        final_mesh_obj.vectors[i] = triangle_vertices
+    
+    final_mesh_obj.save(filepath)
+    print(f"Saved gapped difference STL to '{filepath}' with {total_objects} objects ({num_triangles} triangles). Gap: {gap_mm}mm.")
+    return True # Indicate file saved
 
 def save_vox_file(filepath, voxel_data_bool, original_palette):
     """Saves the boolean voxel data to a .vox file, clipping if dimensions exceed 255."""
@@ -392,8 +508,10 @@ def main():
     output_cutouts_stl_path = os.path.join(output_dir, f"{base_name}_cutouts.stl")
     output_scaled_vox_path = os.path.join(output_dir, f"{base_name}_scaled.vox") # New path for scaled .vox
     output_scaled_stl_path = os.path.join(output_dir, f"{base_name}_scaled.stl") # New path for scaled .stl
+    output_gapped_diff_stl_path = os.path.join(output_dir, f"{base_name}_gapped_diff.stl") # New path
 
-    STL_VOXEL_SIZE_MM = 1.25 # Define the desired size for voxels in STL output
+    STL_VOXEL_SIZE_MM = 1.25
+    GAP_MM = 0.1 # Gap for the new gapped difference STL
 
     try:
         print(f"Loading '{input_path}'...")
@@ -450,8 +568,9 @@ def main():
 
         # Apply surface cutouts
         int_sf = int(round(scale_factor))
-        data_for_erosion = scaled_voxel_data # Default to scaled_voxel_data
-        cutout_voxels_to_save = np.zeros_like(scaled_voxel_data, dtype=bool) # Initialize empty cutouts
+        data_for_erosion = scaled_voxel_data 
+        cutout_voxels_to_save = np.zeros_like(scaled_voxel_data, dtype=bool)
+        crop_min_coords = None # Initialize crop_min_coords
 
         if initial_voxel_data_bool.any() and scaled_voxel_data.any() and int_sf > 0 and CUTOUT_SIZE > 0:
             num_voxels_before_cutout = np.sum(scaled_voxel_data)
@@ -476,18 +595,21 @@ def main():
             elif CUTOUT_SIZE <= 0:
                 print(f"Skipping surface cutouts as CUTOUT_SIZE ({CUTOUT_SIZE}) is not positive.")
         
+        processed_voxel_data_eroded_uncropped = data_for_erosion # Store pre-erosion state or post-cutout state
         if erosion_amount > 0:
             print(f"Eroding by {erosion_amount} voxel layers...")
-            processed_voxel_data_eroded = erode_voxels(data_for_erosion, erosion_amount)
-            print(f"Dimensions after erosion (before crop): {processed_voxel_data_eroded.shape}")
-            if np.any(processed_voxel_data_eroded):
-                processed_voxel_data = crop_voxel_data(processed_voxel_data_eroded)
+            processed_voxel_data_eroded_uncropped = erode_voxels(data_for_erosion, erosion_amount)
+            print(f"Dimensions after erosion (before crop): {processed_voxel_data_eroded_uncropped.shape}")
+            if np.any(processed_voxel_data_eroded_uncropped):
+                processed_voxel_data, crop_min_coords = crop_voxel_data(processed_voxel_data_eroded_uncropped)
                 print(f"Dimensions after cropping to content: {processed_voxel_data.shape}")
             else:
-                processed_voxel_data = processed_voxel_data_eroded # Already empty or all False
+                processed_voxel_data = processed_voxel_data_eroded_uncropped 
+                crop_min_coords = None # No crop occurred as data was empty
                 print(f"Skipping crop as data is empty after erosion.")
         else:
-            processed_voxel_data = data_for_erosion # Skip erosion
+            processed_voxel_data = data_for_erosion 
+            crop_min_coords = None # No erosion, so no crop related to erosion path
             print("Skipping erosion step as erosion_amount is 0 or less.")
         
         if np.sum(processed_voxel_data) == 0:
@@ -499,20 +621,78 @@ def main():
         print(f"Saving processed model as .stl file to '{output_stl_path}'...")
         save_stl_file(output_stl_path, processed_voxel_data, output_voxel_size_mm=STL_VOXEL_SIZE_MM)
 
-        if np.any(cutout_voxels_to_save):
-            print(f"Saving cutout voxels to .vox file: '{output_cutouts_vox_path}'...")
-            save_vox_file(output_cutouts_vox_path, cutout_voxels_to_save, original_palette)
-            print(f"Saving cutout voxels as .stl file: '{output_cutouts_stl_path}'...")
-            save_stl_file(output_cutouts_stl_path, cutout_voxels_to_save, output_voxel_size_mm=STL_VOXEL_SIZE_MM)
+        # Calculate and save gapped difference STL
+        if np.any(scaled_voxel_data):
+            print("Calculating boolean difference for gapped STL...")
+            
+            processed_voxels_aligned_for_diff = np.zeros_like(scaled_voxel_data, dtype=bool)
+            source_for_processed_stl_actual = processed_voxel_data # This is what _processed.stl is made from
+
+            if np.any(source_for_processed_stl_actual):
+                if crop_min_coords is not None: # Data was cropped from a larger array
+                    xmin, ymin, zmin = crop_min_coords
+                    dx_crop, dy_crop, dz_crop = source_for_processed_stl_actual.shape
+                    slice_x = slice(xmin, xmin + dx_crop)
+                    slice_y = slice(ymin, ymin + dy_crop)
+                    slice_z = slice(zmin, zmin + dz_crop)
+
+                    if (slice_x.start >= 0 and slice_x.stop <= scaled_voxel_data.shape[0] and
+                        slice_y.start >= 0 and slice_y.stop <= scaled_voxel_data.shape[1] and
+                        slice_z.start >= 0 and slice_z.stop <= scaled_voxel_data.shape[2]):
+                        processed_voxels_aligned_for_diff[slice_x, slice_y, slice_z] = source_for_processed_stl_actual
+                    else:
+                        print(f"Warning: Cropped processed data region {crop_min_coords} with shape {source_for_processed_stl_actual.shape} partly outside scaled data bounds {scaled_voxel_data.shape}. Difference might be inaccurate.")
+                        # Fallback to uncropped eroded data if shapes match, otherwise difference will be vs all False
+                        if processed_voxel_data_eroded_uncropped.shape == scaled_voxel_data.shape:
+                             processed_voxels_aligned_for_diff = processed_voxel_data_eroded_uncropped.copy()
+                             print("Using uncropped eroded data for difference due to bounds issue.")
+                        else:
+                             print("Cannot align processed data due to bounds and shape mismatch of fallback. Difference will be vs empty.")
+
+                else: # No cropping was applied to get source_for_processed_stl_actual
+                    if source_for_processed_stl_actual.shape == scaled_voxel_data.shape:
+                        processed_voxels_aligned_for_diff = source_for_processed_stl_actual.copy()
+                    elif not np.any(source_for_processed_stl_actual) and source_for_processed_stl_actual.size == 0:
+                        pass # Correct, processed_voxels_aligned_for_diff remains all False
+                    else:
+                        print(f"Warning: Shape mismatch for difference. Scaled: {scaled_voxel_data.shape}, Processed (uncropped but different shape): {source_for_processed_stl_actual.shape}. Using uncropped data if possible.")
+                        if processed_voxel_data_eroded_uncropped.shape == scaled_voxel_data.shape:
+                            processed_voxels_aligned_for_diff = processed_voxel_data_eroded_uncropped.copy()
+                        else: # Fallback to assuming processed is empty for difference calc
+                            print("Fallback: Assuming empty processed model for difference due to shape mismatch.")
+            
+            difference_voxels = np.logical_and(scaled_voxel_data, np.logical_not(processed_voxels_aligned_for_diff))
+            
+            gapped_stl_saved = False
+            if np.any(difference_voxels):
+                print(f"Saving gapped difference STL to '{output_gapped_diff_stl_path}'...")
+                gapped_stl_saved = save_gapped_difference_stl(
+                    output_gapped_diff_stl_path,
+                    initial_voxel_data_bool, 
+                    difference_voxels,       
+                    int_sf,                  
+                    STL_VOXEL_SIZE_MM,       
+                    GAP_MM                   
+                )
+            else:
+                print("No voxels in boolean difference. Skipping gapped difference STL.")
         else:
-            print(f"No cutout voxels to save for '{output_cutouts_vox_path}' and '{output_cutouts_stl_path}'.")
+            print("Scaled voxel data is empty. Skipping gapped difference STL.")
+            gapped_stl_saved = False
 
         print(f"\nProcessing complete for '{input_path}'.")
         print(f"Output .vox: {output_vox_path}")
         print(f"Output .stl: {output_stl_path}")
         if np.any(scaled_voxel_data):
+            print(f"Output Scaled .vox: {output_scaled_vox_path}")
+            print(f"Output Scaled .stl: {output_scaled_stl_path}")
+            
+        if np.any(cutout_voxels_to_save):
             print(f"Output Cutouts .vox: {output_cutouts_vox_path}")
             print(f"Output Cutouts .stl: {output_cutouts_stl_path}")
+        
+        if 'gapped_stl_saved' in locals() and gapped_stl_saved:
+             print(f"Output Gapped Difference .stl: {output_gapped_diff_stl_path}")
             
 
     except ImportError as e:
