@@ -262,68 +262,80 @@ def save_vox_file(filepath, voxel_data_bool, original_palette):
     writer.write()
 
 def save_stl_file(filepath, voxel_data_bool):
-    """Converts boolean voxel data to an STL mesh by creating cubes for each voxel and saves it."""
+    """Converts boolean voxel data to an STL mesh by creating cubes for each voxel and saves it.
+    Only external faces are included to create a hollow mesh.
+    """
     if not np.any(voxel_data_bool):
         print(f"No voxels to save to STL file '{filepath}'. Skipping.")
         return
 
-    x_coords, y_coords, z_coords = np.where(voxel_data_bool)
-    num_voxels = len(x_coords)
+    dx, dy, dz = voxel_data_bool.shape
+    
+    # List to store all the triangles for the external faces
+    all_triangles = []
 
-    if num_voxels == 0:
-        print(f"No voxels to save to STL file '{filepath}'. Skipping.")
+    for x in range(dx):
+        for y in range(dy):
+            for z in range(dz):
+                if voxel_data_bool[x, y, z]:
+                    # This is a solid voxel, check its 6 faces
+                    vx, vy, vz = float(x), float(y), float(z)
+                    
+                    # Define the 8 vertices of the cube for voxel (vx, vy, vz)
+                    v = [
+                        (vx, vy, vz),           # 0: bottom-left-front
+                        (vx + 1, vy, vz),       # 1: bottom-right-front
+                        (vx + 1, vy + 1, vz),   # 2: bottom-right-back
+                        (vx, vy + 1, vz),       # 3: bottom-left-back
+                        (vx, vy, vz + 1),       # 4: top-left-front
+                        (vx + 1, vy, vz + 1),   # 5: top-right-front
+                        (vx + 1, vy + 1, vz + 1), # 6: top-right-back
+                        (vx, vy + 1, vz + 1)    # 7: top-left-back
+                    ]
+
+                    # Check -X face (left)
+                    if x == 0 or not voxel_data_bool[x - 1, y, z]:
+                        all_triangles.append([v[0], v[4], v[7]])
+                        all_triangles.append([v[0], v[7], v[3]])
+                    
+                    # Check +X face (right)
+                    if x == dx - 1 or not voxel_data_bool[x + 1, y, z]:
+                        all_triangles.append([v[1], v[2], v[6]]) # Corrected winding
+                        all_triangles.append([v[1], v[6], v[5]]) # Corrected winding
+
+                    # Check -Y face (front)
+                    if y == 0 or not voxel_data_bool[x, y - 1, z]:
+                        all_triangles.append([v[0], v[1], v[5]])
+                        all_triangles.append([v[0], v[5], v[4]])
+
+                    # Check +Y face (back)
+                    if y == dy - 1 or not voxel_data_bool[x, y + 1, z]:
+                        all_triangles.append([v[3], v[7], v[6]]) # Corrected winding as per user request
+                        all_triangles.append([v[3], v[6], v[2]]) # Corrected winding as per user request
+
+                    # Check -Z face (bottom)
+                    if z == 0 or not voxel_data_bool[x, y, z - 1]:
+                        all_triangles.append([v[0], v[2], v[1]])
+                        all_triangles.append([v[0], v[3], v[2]])
+                        
+                    # Check +Z face (top)
+                    if z == dz - 1 or not voxel_data_bool[x, y, z + 1]:
+                        all_triangles.append([v[4], v[5], v[6]])
+                        all_triangles.append([v[4], v[6], v[7]])
+
+    if not all_triangles:
+        print(f"No external faces found to save to STL file '{filepath}'. Skipping.")
         return
 
-    # Each voxel cube has 6 faces, each face 2 triangles = 12 triangles
-    # Create the mesh object with the correct number of faces (triangles)
-    stl_mesh_obj = mesh.Mesh(np.zeros(num_voxels * 12, dtype=mesh.Mesh.dtype))
+    # Create the mesh object
+    num_triangles = len(all_triangles)
+    stl_mesh_obj = mesh.Mesh(np.zeros(num_triangles, dtype=mesh.Mesh.dtype))
+    for i, triangle_vertices in enumerate(all_triangles):
+        stl_mesh_obj.vectors[i] = triangle_vertices
     
-    triangle_idx = 0
-    for i in range(num_voxels):
-        vx, vy, vz = float(x_coords[i]), float(y_coords[i]), float(z_coords[i])
-
-        # Define the 8 vertices of the cube for voxel (vx, vy, vz)
-        v = [
-            (vx, vy, vz),           # 0: bottom-left-front
-            (vx + 1, vy, vz),       # 1: bottom-right-front
-            (vx + 1, vy + 1, vz),   # 2: bottom-right-back
-            (vx, vy + 1, vz),       # 3: bottom-left-back
-            (vx, vy, vz + 1),       # 4: top-left-front
-            (vx + 1, vy, vz + 1),   # 5: top-right-front
-            (vx + 1, vy + 1, vz + 1), # 6: top-right-back
-            (vx, vy + 1, vz + 1)    # 7: top-left-back
-        ]
-
-        # Define the 12 triangles (2 per face), ensuring counter-clockwise winding for outward normals
-        
-        # Bottom face (-Z normal)
-        stl_mesh_obj.vectors[triangle_idx]     = [v[0], v[2], v[1]]
-        stl_mesh_obj.vectors[triangle_idx + 1] = [v[0], v[3], v[2]]
-        
-        # Top face (+Z normal)
-        stl_mesh_obj.vectors[triangle_idx + 2] = [v[4], v[5], v[6]]
-        stl_mesh_obj.vectors[triangle_idx + 3] = [v[4], v[6], v[7]]
-        
-        # Front face (-Y normal)
-        stl_mesh_obj.vectors[triangle_idx + 4] = [v[0], v[1], v[5]]
-        stl_mesh_obj.vectors[triangle_idx + 5] = [v[0], v[5], v[4]]
-        
-        # Back face (+Y normal)
-        stl_mesh_obj.vectors[triangle_idx + 6] = [v[3], v[2], v[6]]
-        stl_mesh_obj.vectors[triangle_idx + 7] = [v[3], v[6], v[7]]
-        
-        # Left face (-X normal)
-        stl_mesh_obj.vectors[triangle_idx + 8] = [v[0], v[4], v[7]]
-        stl_mesh_obj.vectors[triangle_idx + 9] = [v[0], v[7], v[3]]
-        
-        # Right face (+X normal)
-        stl_mesh_obj.vectors[triangle_idx + 10] = [v[1], v[5], v[6]]
-        stl_mesh_obj.vectors[triangle_idx + 11] = [v[1], v[6], v[2]]
-        
-        triangle_idx += 12
-
     stl_mesh_obj.save(filepath)
-    print(f"Saved blocky STL file to '{filepath}' with {num_voxels} voxels ({num_voxels*12} triangles).")
+    num_voxels = np.sum(voxel_data_bool)
+    print(f"Saved hollow STL file to '{filepath}' with {num_voxels} voxels ({num_triangles} triangles representing external faces).")
 
 
 def main():
