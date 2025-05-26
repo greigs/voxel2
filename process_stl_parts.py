@@ -598,6 +598,23 @@ def main():
         if not mesh.is_watertight:
             print("Error: Could not make initial mesh watertight. Exiting.")
             sys.exit(1)
+
+    print(f"DEBUG_PS: Original mesh center of mass: {mesh.center_mass}")
+    print(f"DEBUG_PS: Original mesh extents: {mesh.extents}")
+    
+    # Get the transform that aligns the OBB with the axes
+    # and apply its inverse to the mesh to achieve the alignment.
+    # This should make the mesh's OBB axis-aligned.
+    obb_transform = mesh.bounding_box_oriented.transform
+    mesh.apply_transform(np.linalg.inv(obb_transform))
+    # After this, the mesh.bounds should be equivalent to its OBB extents
+    # and its axes should be aligned with the world axes.
+    # It's also good to move the mesh to origin based on its new bounds for consistency.
+    mesh.apply_translation(-mesh.bounds[0])
+
+    print("DEBUG_PS: Mesh reoriented using OBB alignment and translated to origin.")
+    print(f"DEBUG_PS: New mesh center of mass after OBB reorient and translate: {mesh.center_mass}") 
+    print(f"DEBUG_PS: New mesh extents after OBB reorient and translate: {mesh.extents}")
     
     # Apply a small uniform scaling if dimensions are extremely small, to avoid precision issues
     # This is a heuristic and might need adjustment or removal depending on typical model scales
