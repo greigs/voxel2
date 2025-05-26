@@ -214,26 +214,55 @@ def recursively_cut_mesh(mesh_to_process, max_dim, separation, current_depth, or
         plane_origin = mesh_to_slice.bounds.mean(axis=0) # Use center of current mesh for other axes
         plane_origin[cut_axis] = cut_point
         
-        slice_result = None
+        part1, part2 = None, None
         try:
-            slice_result = trimesh.intersections.slice_mesh_plane(
-                mesh=mesh_to_slice, 
-                plane_normal=plane_normal, 
+            # Get part on the positive side of the plane
+            part1 = trimesh.intersections.slice_mesh_plane(
+                mesh=mesh_to_slice,
+                plane_normal=plane_normal,
+                plane_origin=plane_origin,
+                cap=True
+            )
+            # Get part on the negative side of the plane (positive side of the inverted normal)
+            part2 = trimesh.intersections.slice_mesh_plane(
+                mesh=mesh_to_slice,
+                plane_normal=-plane_normal, # Inverted normal
                 plane_origin=plane_origin,
                 cap=True
             )
         except Exception as e:
-            print(f"Error during automated slice_mesh_plane (axis {axis_labels[cut_axis]}, depth {current_depth}): {e}")
+            print(f"Error during automated slice_mesh_plane calls (axis {axis_labels[cut_axis]}, depth {current_depth}): {e}")
 
         processed_slice_parts = []
-        if isinstance(slice_result, list):
-            processed_slice_parts = slice_result
-        elif isinstance(slice_result, trimesh.Trimesh):
-            # If a single mesh is returned, it means no effective cut for our purpose (splitting into two)
-            if len(slice_result.faces) < len(mesh_to_slice.faces) or not np.allclose(slice_result.volume, mesh_to_slice.volume):
-                 print(f"Debug (depth {current_depth}, axis {axis_labels[cut_axis]}): slice_mesh_plane returned a single, altered mesh. Not a successful split into two.")
-            # else: it's the original mesh, no cut
-            pass # Not a successful split into multiple parts
+        # Validate the two parts
+        valid_part1 = part1 and not part1.is_empty and hasattr(part1, 'volume') and part1.volume > 1e-6 and len(part1.faces) >=4
+        valid_part2 = part2 and not part2.is_empty and hasattr(part2, 'volume') and part2.volume > 1e-6 and len(part2.faces) >=4
+
+        if valid_part1 and valid_part2:
+            vol_original = mesh_to_slice.volume
+            vol_part1 = part1.volume
+            vol_part2 = part2.volume
+
+            is_part1_original = np.allclose(vol_part1, vol_original, rtol=1e-3, atol=1e-3)
+            is_part2_original = np.allclose(vol_part2, vol_original, rtol=1e-3, atol=1e-3)
+            
+            # A successful split means:
+            # - Neither part is effectively the original mesh.
+            # - Their combined volume is close to the original mesh's volume.
+            if not is_part1_original and not is_part2_original and \
+               np.allclose(vol_part1 + vol_part2, vol_original, rtol=0.05): # 5% tolerance for capping/meshing artifacts
+                print(f"Debug (depth {current_depth}, axis {axis_labels[cut_axis]}): Successfully sliced into two parts. Part1 vol: {vol_part1:.2f}, Part2 vol: {vol_part2:.2f}, Original vol: {vol_original:.2f}")
+                processed_slice_parts = [part1, part2]
+            else:
+                print(f"Debug (depth {current_depth}, axis {axis_labels[cut_axis]}): Automated slice did not result in two distinct, valid parts relative to original. " +
+                      f"P1_orig: {is_part1_original}, P2_orig: {is_part2_original}, Vol_sum_ok: {np.allclose(vol_part1 + vol_part2, vol_original, rtol=0.05)}. " +
+                      f"P1_vol: {vol_part1:.2f}, P2_vol: {vol_part2:.2f}, Orig_vol: {vol_original:.2f}")
+        else:
+            p1_info = f"Part1: {'valid' if valid_part1 else 'invalid/empty'}"
+            p2_info = f"Part2: {'valid' if valid_part2 else 'invalid/empty'}"
+            if part1 and hasattr(part1, 'volume'): p1_info += f" (vol: {part1.volume:.2f})"
+            if part2 and hasattr(part2, 'volume'): p2_info += f" (vol: {part2.volume:.2f})"
+            print(f"Debug (depth {current_depth}, axis {axis_labels[cut_axis]}): One or both sliced parts are invalid/empty. {p1_info}; {p2_info}")
         
         valid_sliced_parts = []
         for i, p in enumerate(processed_slice_parts):
