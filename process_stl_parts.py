@@ -895,6 +895,66 @@ def main():
             
             print(f"DEBUG_PS: Standard processing with 45-degree angled cuts completed for {input_stl_path}.")
 
+            # Consolidate outputs if multiple valid cut types exist
+            print(f"DEBUG_PS: Checking for consolidation of angled cut outputs in {angled_cuts_output_dir_for_file}")
+            potential_cut_type_subdirs = [d for d in os.listdir(angled_cuts_output_dir_for_file)
+                                          if os.path.isdir(os.path.join(angled_cuts_output_dir_for_file, d))]
+            
+            successful_cut_dirs_details = []
+
+            for subdir_name in potential_cut_type_subdirs:
+                current_subdir_path = os.path.join(angled_cuts_output_dir_for_file, subdir_name)
+                valid_stl_files_in_subdir = []
+                if not os.path.isdir(current_subdir_path): # Should not happen based on above list comprehension
+                    continue
+
+                for item in os.listdir(current_subdir_path):
+                    item_path = os.path.join(current_subdir_path, item)
+                    # We are looking for .stl files directly in this subdir, not in 'failed_cuts...'
+                    if item.lower().endswith('.stl') and os.path.isfile(item_path):
+                        valid_stl_files_in_subdir.append(item)
+                
+                if valid_stl_files_in_subdir:
+                    successful_cut_dirs_details.append({
+                        'path': current_subdir_path, 
+                        'files': valid_stl_files_in_subdir, 
+                        'name': subdir_name
+                    })
+            
+            if len(successful_cut_dirs_details) > 1:
+                print(f"DEBUG_PS: Found {len(successful_cut_dirs_details)} subdirectories with valid cuts. Consolidating to parent.")
+                
+                # Choose the first one found (no other criteria specified)
+                chosen_dir_info = successful_cut_dirs_details[0]
+                chosen_dir_path = chosen_dir_info['path']
+                
+                print(f"DEBUG_PS: Selecting cuts from: {chosen_dir_info['name']}")
+
+                for stl_file_name in chosen_dir_info['files']:
+                    source_stl_path = os.path.join(chosen_dir_path, stl_file_name)
+                    # Destination is the parent directory of all cut_type_subdirs
+                    destination_stl_path = os.path.join(angled_cuts_output_dir_for_file, stl_file_name)
+                    try:
+                        shutil.copy2(source_stl_path, destination_stl_path)
+                        print(f"DEBUG_PS: Copied {stl_file_name} to {angled_cuts_output_dir_for_file}")
+                    except Exception as e_copy:
+                        print(f"DEBUG_PS: Error copying {stl_file_name} from {source_stl_path} to {destination_stl_path}: {e_copy}")
+
+                # Delete all original subdirectories (XY_plane_cuts, XZ_plane_cuts, etc.)
+                # whether they were successful or not, as per "delete anything else in that parent folder"
+                for subdir_name_to_delete in potential_cut_type_subdirs:
+                    path_to_remove = os.path.join(angled_cuts_output_dir_for_file, subdir_name_to_delete)
+                    if os.path.isdir(path_to_remove):
+                        try:
+                            shutil.rmtree(path_to_remove)
+                            print(f"DEBUG_PS: Removed subdirectory: {path_to_remove}")
+                        except Exception as e_rm:
+                            print(f"DEBUG_PS: Error removing directory {path_to_remove}: {e_rm}")
+            elif successful_cut_dirs_details: # Exactly one
+                 print(f"DEBUG_PS: Found 1 subdirectory ({successful_cut_dirs_details[0]['name']}) with valid cuts. No consolidation action taken as per 'multiple output folders' rule.")
+            else: # Zero successful_cut_dirs_details
+                 print(f"DEBUG_PS: No subdirectories with directly contained valid .stl files found in {angled_cuts_output_dir_for_file}. No consolidation performed.")
+
         else: # Initial mesh not valid
             print(f"DEBUG_PS: Input STL mesh is not valid: {'; '.join(validation_messages)}. Not proceeding with cutting. Exiting.") # Clarified message
             sys.exit(1)
