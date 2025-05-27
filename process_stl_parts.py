@@ -41,6 +41,7 @@ FLAT_FACE_NORMAL_TOLERANCE = 1e-3
 FLAT_FACE_FILL_RATIO = 0.80 # Relaxed from 0.85
 NORMAL_SIMILARITY_TOLERANCE = 1e-4 # For comparing normals to find unique ones
 MAX_DIM_FOR_MULTIAXIS_OVERSIZE_MM = 8.0 # New rule: max dimension if more than two axes exceed this
+MAX_DIM_FOR_MULTIAXIS_MM = 10.0 # Define the missing constant
 OUTPUT_DIR = "" # Initialize globally, will be set in main
 
 def _evaluate_candidate_cut(original_mesh_to_slice, plane_normal, plane_origin, cut_description, current_depth):
@@ -522,8 +523,8 @@ def recursively_cut_mesh(mesh, max_dim, current_depth=0):
     cut_axis = -1 # Initialize cut_axis
     cut_reason = ""
 
-    print(f"DEBUG_PS: Info (depth {current_depth}): Mesh dimensions {dims}. Overall max_dim: {max_dim}mm. Multi-axis limit: {MAX_DIM_FOR_MULTIAXIS_OVERSIZE_MM}mm.")
-    print(f"DEBUG_PS: Indices of dims exceeding overall max_dim ({max_dim}mm): {dims_exceeding_overall_max_indices}. Num dims > {MAX_DIM_FOR_MULTIAXIS_OVERSIZE_MM}mm: {num_dims_over_multiaxis_limit}.")
+    print(f"DEBUG_PS: Info (depth {current_depth}): Mesh dimensions {dims}. Overall max_dim: {max_dim}mm. Multi-axis limit: {MAX_DIM_FOR_MULTIAXIS_MM}mm.")
+    print(f"DEBUG_PS: Indices of dims exceeding overall max_dim ({max_dim}mm): {dims_exceeding_overall_max_indices}. Num dims > {MAX_DIM_FOR_MULTIAXIS_MM}mm: {num_dims_over_multiaxis_limit}.")
 
     if dims_exceeding_overall_max_indices:
         needs_cutting = True
@@ -535,7 +536,7 @@ def recursively_cut_mesh(mesh, max_dim, current_depth=0):
         # All dimensions are <= max_dim, but 3 dimensions are > MAX_DIM_FOR_MULTIAXIS_MM.
         # Cut along the largest dimension overall.
         cut_axis = np.argmax(dims)
-        cut_reason = f"{num_dims_over_multiaxis_limit} dimensions exceed {MAX_DIM_FOR_MULTIAXIS_MM}mm"
+        cut_reason = f"{num_dims_over_multiaxis_limit} dimensions exceed {MAX_DIM_FOR_MULTIAXIS_MM}mm" # Corrected variable in log message
     
     if not needs_cutting:
         print(f"DEBUG_PS: No cut needed for mesh at depth {current_depth} (dims: {dims}). Conditions not met. Returning as single part.")
@@ -744,7 +745,7 @@ def perform_angled_cuts(original_mesh, file_naming_prefix, base_output_path_for_
     print(f"DEBUG_PS: Finished angled cuts for files prefixed '{file_naming_prefix}'")
 
 def main():
-    global OUTPUT_DIR # Declare OUTPUT_DIR as global to modify it
+    global OUTPUT_DIR, MAX_DIM, MIN_DIM, MIN_VOLUME_MM3, MAX_ASPECT_RATIO, FLAT_FACE_MIN_AREA_MM2, FLAT_FACE_NORMAL_DEVIATION_DEG, FLAT_FACE_FILL_RATIO, MAX_DIM_FOR_MULTIAXIS_MM # Added MAX_DIM_FOR_MULTIAXIS_MM
     print("DEBUG_PS: main() function started.", flush=True) 
     sys.stdout.flush() # Explicitly flush stdout
     sys.stderr.flush() # Explicitly flush stderr
@@ -862,20 +863,43 @@ def main():
         mesh.apply_translation(-mesh.bounds[0])
         print(f"DEBUG_PS: Standard processing reoriented. New bounds: {mesh.bounds.round(3)}")
 
-        is_valid, validation_messages = validate_part(mesh, "input_stl_validation", max_dim=MAX_DIM, min_flat_face_dim=MIN_FLAT_FACE_DIMENSION_MM)
+        # Corrected initial validate_part call to match the signature used later
+        is_valid, validation_messages = validate_part(
+            mesh, 
+            "input_stl_validation", 
+            max_dim=MAX_DIM, 
+            min_flat_face_dim=MIN_FLAT_FACE_DIMENSION_MM
+        )
         
         if is_valid:
-            print(f"DEBUG_PS: Input STL mesh is valid. Proceeding with cutting.")
-            output_mesh_path = os.path.join(OUTPUT_DIR, "validated_input_mesh.stl")
-            mesh.export(output_mesh_path)
-            print(f"DEBUG_PS: Exported validated input mesh to: {output_mesh_path}")
-        else:
-            print(f"DEBUG_PS: Input STL mesh is not valid: {validation_messages}. Exiting.")
+            print(f"DEBUG_PS: Input STL mesh is valid. Original dimensions: {mesh.bounds[1] - mesh.bounds[0]}. Proceeding with 45-degree angled cuts.") # Updated message
+            # Removed validated_input_mesh.stl export, as perform_angled_cuts handles its own outputs.
+
+            original_filename_base = os.path.splitext(os.path.basename(input_stl_path))[0]
+            
+            # Define a specific base output directory for the angled cuts of this specific input file
+            # OUTPUT_DIR_BASE is args.output_dir
+            angled_cuts_output_dir_for_file = os.path.join(OUTPUT_DIR_BASE, f"{original_filename_base}_angled_cuts")
+            if not os.path.exists(angled_cuts_output_dir_for_file):
+                os.makedirs(angled_cuts_output_dir_for_file)
+                print(f"DEBUG_PS: Created directory for angled cuts: {angled_cuts_output_dir_for_file}")
+
+            # Call perform_angled_cuts
+            print(f"DEBUG_PS: Calling perform_angled_cuts for standard processing of {input_stl_path}.")
+            perform_angled_cuts(
+                original_mesh=mesh, 
+                file_naming_prefix=original_filename_base, 
+                base_output_path_for_this_mesh=angled_cuts_output_dir_for_file, 
+                angle_deg=45.0
+            )
+            
+            print(f"DEBUG_PS: Standard processing with 45-degree angled cuts completed for {input_stl_path}.")
+
+        else: # Initial mesh not valid
+            print(f"DEBUG_PS: Input STL mesh is not valid: {'; '.join(validation_messages)}. Not proceeding with cutting. Exiting.") # Clarified message
             sys.exit(1)
 
-        print("DEBUG_PS: Standard processing completed.")
-    
-    print("DEBUG_PS: Program finished. Check output directories for results.")
+    # print("DEBUG_PS: Program finished. Check output directories for results.") # This is the overall program finish message
 print("DEBUG_PS: Global variables and functions defined. Script execution reached end, before calling main.", flush=True)
 
 if __name__ == "__main__":
