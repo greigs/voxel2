@@ -1,15 +1,40 @@
-import os
 import sys
-import argparse
-import numpy as np
-import trimesh
+print("DEBUG_PS: Python interpreter started, sys imported.", flush=True)
+
+try:
+    import os
+    print("DEBUG_PS: os imported.", flush=True)
+    import argparse
+    print("DEBUG_PS: argparse imported.", flush=True)
+    import numpy as np
+    print("DEBUG_PS: numpy imported.", flush=True)
+    import trimesh
+    print("DEBUG_PS: trimesh imported.", flush=True)
+    import math
+    print("DEBUG_PS: math imported.", flush=True)
+    import logging
+    print("DEBUG_PS: logging imported.", flush=True)
+    import time
+    print("DEBUG_PS: time imported.", flush=True)
+    import shutil
+    print("DEBUG_PS: shutil imported.", flush=True)
+    from scipy.spatial import ConvexHull, Delaunay
+    print("DEBUG_PS: scipy.spatial imported.", flush=True)
+    from collections import deque
+    print("DEBUG_PS: collections.deque imported.", flush=True)
+    print("DEBUG_PS: All imports successful.", flush=True)
+except Exception as e:
+    print(f"DEBUG_PS: Exception during import: {e}", flush=True)
+    sys.exit(1) # Exit if imports fail
 
 # Global parameters (adjust as needed)
 MAX_DIM = 150.0  # Maximum dimension in mm for any side of the part
 MIN_FLAT_FACE_DIMENSION_MM = 8.0 # Minimum length for an edge of the required flat face
 MIN_FLAT_FACE_ASPECT_RATIO = 1.0 # Minimum aspect ratio for a face to be considered (e.g., 1.0 for square-like)
 FLAT_FACE_ANGLE_TOLERANCE_DEGREES = 1.0 # Max angle deviation for normals to be considered coplanar
-MAX_CUTTING_DEPTH = 10 # Maximum recursion depth for cutting
+MIN_CUTTING_DEPTH = 0
+MAX_CUTTING_DEPTH = 10  # Example: Limit recursion to 10 levels
+MIN_VOLUME_FOR_SUBSTANTIAL_PART_ANGLED = 1.0 # Example: 1 mm^3, adjust as needed
 SPACING_MM = 5.0 # Default spacing for cuts if applicable elsewhere
 SEPARATION_MM = 1.0 # Separation distance for cut pieces
 FLAT_FACE_NORMAL_TOLERANCE = 1e-3 
@@ -220,69 +245,89 @@ def check_rectangular_face(flat_face_vertices, min_dim_mm, aspect_ratio):
         polygon = Polygon(flat_face_vertices)
         if not polygon.is_valid:
             print(f"DEBUG_PS: Polygon created from {len(flat_face_vertices)} vertices is not valid: {explain_validity(polygon)}")
-            # Attempt to simplify or buffer slightly if invalid due to self-intersection or floating point issues
             polygon = polygon.buffer(0) # Buffer by 0 can sometimes fix minor validity issues
             if not polygon.is_valid:
                 print(f"DEBUG_PS: Polygon still invalid after buffer(0).")
                 return False
         
-        # Get the oriented bounding box (OBB)
-        # For Shapely < 2.0, this might be minimum_rotated_rectangle
-        # For Shapely >= 2.0, it's oriented_bounding_box
+        if polygon.area < 1e-6: # Polygon itself has negligible area
+            print(f"DEBUG_PS: Polygon area is negligible ({polygon.area:.4f}).")
+            return False
+
+        is_obb_case = False
+        obb_polygon = None
+
         if hasattr(polygon, 'oriented_bounding_box'):
-            obb_polygon = polygon.oriented_bounding_box 
+            obb_polygon = polygon.oriented_bounding_box
+            is_obb_case = True
         elif hasattr(polygon, 'minimum_rotated_rectangle'): # Compatibility for older Shapely
             obb_polygon = polygon.minimum_rotated_rectangle
-        else:
-            print("DEBUG_PS: Neither oriented_bounding_box nor minimum_rotated_rectangle found on polygon object.")
-            # Fallback to envelope (Axis-Aligned Bounding Box) - less accurate for rotated faces
+            is_obb_case = True
+
+        if is_obb_case:
+            if obb_polygon is None or obb_polygon.is_empty:
+                print(f"DEBUG_PS: OBB polygon is None or empty.")
+                return False 
+
+            current_bounding_box_area = obb_polygon.area
+            if current_bounding_box_area < 1e-6: # Avoid division by zero or issues with tiny OBB
+                print(f"DEBUG_PS: OBB area is near zero ({current_bounding_box_area:.4f}).")
+                return False
+
+            actual_fill_ratio = polygon.area / current_bounding_box_area
+            print(f"DEBUG_PS: Polygon area: {polygon.area:.2f}, OBB area: {current_bounding_box_area:.2f}, Fill ratio: {actual_fill_ratio:.2f} (required >= {FLAT_FACE_FILL_RATIO})")
+            if actual_fill_ratio < FLAT_FACE_FILL_RATIO:
+                print(f"DEBUG_PS: Fill ratio {actual_fill_ratio:.2f} is less than required {FLAT_FACE_FILL_RATIO}.")
+                return False
+
+            obb_coords = np.array(obb_polygon.exterior.coords)
+            edge_lengths = [np.linalg.norm(obb_coords[i] - obb_coords[i+1]) for i in range(len(obb_coords)-1)]
+            
+            if len(edge_lengths) < 4: # Should be 5 points for 4 segments in a closed loop for OBB polygon
+                print(f"DEBUG_PS: OBB has unexpected number of edge lengths: {len(edge_lengths)}")
+                return False
+
+            unique_lengths = sorted(list(set(np.round(edge_lengths, decimals=3))))
+            
+            if len(unique_lengths) == 1:
+                 dims = [unique_lengths[0], unique_lengths[0]]
+            elif len(unique_lengths) >= 2 :
+                 dims = unique_lengths[:2] # Takes the two smallest unique lengths, assuming they are width/height
+            else: 
+                print(f"DEBUG_PS: OBB has problematic unique edge lengths: {unique_lengths}. OBB area: {obb_polygon.area:.4f}")
+                # This case implies an issue with OBB shape or edge calculation
+                return False
+            
+            print(f"DEBUG_PS: OBB dimensions from unique_lengths: {dims[0]:.2f} x {dims[1]:.2f} mm")
+            result = dims[0] >= min_dim_mm and dims[1] >= min_dim_mm
+            print(f"DEBUG_PS: OBB Check result: {result} (dims[0]={dims[0]:.2f} >= {min_dim_mm} AND dims[1]={dims[1]:.2f} >= {min_dim_mm})")
+            return result
+
+        else: # Fallback to AABB
+            print("DEBUG_PS: Neither oriented_bounding_box nor minimum_rotated_rectangle found on polygon object. Using AABB.")
             minx, miny, maxx, maxy = polygon.bounds
-            dims = sorted([maxx - minx, maxy - miny])
+            aabb_width = maxx - minx
+            aabb_height = maxy - miny
+            current_bounding_box_area = aabb_width * aabb_height
+
+            if current_bounding_box_area < 1e-6: # Avoid division by zero for AABB
+                print(f"DEBUG_PS: AABB area is near zero ({current_bounding_box_area:.4f}).")
+                return False
+
+            actual_fill_ratio = polygon.area / current_bounding_box_area
+            print(f"DEBUG_PS: Polygon area: {polygon.area:.2f}, AABB area: {current_bounding_box_area:.2f}, Fill ratio: {actual_fill_ratio:.2f} (required >= {FLAT_FACE_FILL_RATIO})")
+            if actual_fill_ratio < FLAT_FACE_FILL_RATIO:
+                print(f"DEBUG_PS: Fill ratio {actual_fill_ratio:.2f} is less than required {FLAT_FACE_FILL_RATIO} for AABB.")
+                return False
+
+            dims = sorted([aabb_width, aabb_height])
             print(f"DEBUG_PS: Using AABB dimensions: {dims[0]:.2f} x {dims[1]:.2f} mm (less accurate)")
-            result = dims[0] >= min_dim_mm and dims[1] >= min_dim_mm # For 8x8, both sides must be >= 8
+            result = dims[0] >= min_dim_mm and dims[1] >= min_dim_mm
             print(f"DEBUG_PS: AABB Check result: {result} (dims[0]={dims[0]:.2f}, dims[1]={dims[1]:.2f} vs min_dim={min_dim_mm})")
             return result
 
-        # OBB is a polygon, get its exterior coordinates and calculate extents
-        obb_coords = np.array(obb_polygon.exterior.coords)
-        
-        # Calculate edge lengths of the OBB
-        edge_lengths = [np.linalg.norm(obb_coords[i] - obb_coords[i+1]) for i in range(len(obb_coords)-1)]
-        
-        # OBB should have 4 distinct edge lengths in pairs (e.g., w, h, w, h)
-        # We need the width and height.
-        if len(edge_lengths) < 4: # Should be 5 points for 4 segments in a closed loop
-            print(f"DEBUG_PS: OBB has unexpected number of edge lengths: {len(edge_lengths)}")
-            return False
-
-        # Get unique lengths, should be 2 for a rectangle
-        unique_lengths = sorted(list(set(np.round(edge_lengths, decimals=3)))) # Round to handle float precision
-        
-        if len(unique_lengths) == 1: # OBB is a square (all sides of OBB are approx equal)
-             dims = [unique_lengths[0], unique_lengths[0]]
-        elif len(unique_lengths) >= 2 : # OBB is a rectangle. Take the two smallest unique lengths as dimensions.
-                                       # For a true rectangular OBB, unique_lengths should ideally have 2 values.
-             dims = unique_lengths[:2]
-        else: # len(unique_lengths) == 0. This implies an issue (e.g. OBB has no area or edges).
-            print(f"DEBUG_PS: OBB has problematic unique edge lengths: {unique_lengths}. OBB area: {obb_polygon.area:.4f}")
-            # Fallback: use shapely's OBB extents if available (newer shapely might provide this directly)
-            # This part of trimesh's OBB was `obb.extents`
-            # For shapely's polygon.oriented_bounding_box, we need to calculate extents.
-            # The `minimum_rotated_rectangle` in older shapely is a polygon.
-            # A common way to get extents from an OBB polygon:
-            # 1. Get the points of the OBB polygon.
-            # 2. Calculate the length of two adjacent sides.
-            # This is what `edge_lengths` and `unique_lengths` tries to do.
-            # If `obb_polygon.area` is near zero, it's degenerate.
-            if obb_polygon.area < 1e-3: # Effectively zero area
-                print(f"DEBUG_PS: OBB area is near zero ({obb_polygon.area:.4f}), confirming as not a valid rectangle.")
-            # else: # This path is if unique_lengths is empty but area is not zero - very unlikely with current edge_lengths calc.
-            #    print(f"DEBUG_PS: Could not reliably determine OBB dimensions from unique_lengths: {unique_lengths}, but area is {obb_polygon.area:.4f}")
-            return False
-
-
     except Exception as e:
-        print(f"DEBUG_PS: Error in check_rectangular_face during polygon processing or OBB: {e}")
+        print(f"DEBUG_PS: Error in check_rectangular_face during polygon processing or OBB/AABB: {e}")
         return False
     
     print(f"DEBUG_PS: OBB dimensions from unique_lengths: {dims[0]:.2f} x {dims[1]:.2f} mm")
@@ -470,7 +515,7 @@ def recursively_cut_mesh(mesh, max_dim, current_depth=0):
     # Rule 1: Check against the overall max dimension (e.g., 150mm, passed as max_dim)
     dims_exceeding_overall_max_indices = [i for i, dim_val in enumerate(dims) if dim_val > max_dim]
     
-    # Rule 2: Check how many dimensions exceed MAX_DIM_FOR_MULTIAXIS_OVERSIZE_MM (e.g., 8mm)
+    # Rule 2: Check how many dimensions exceed MAX_DIM_FOR_MULTIAXIS_MM (e.g., 8mm)
     num_dims_over_multiaxis_limit = sum(1 for d in dims if d > MAX_DIM_FOR_MULTIAXIS_OVERSIZE_MM)
 
     needs_cutting = False
@@ -487,10 +532,10 @@ def recursively_cut_mesh(mesh, max_dim, current_depth=0):
         cut_reason = f"dimension {dims[cut_axis]:.2f}mm on axis {cut_axis} exceeds overall max_dim {max_dim}mm"
     elif num_dims_over_multiaxis_limit > 2:
         needs_cutting = True
-        # All dimensions are <= max_dim, but 3 dimensions are > MAX_DIM_FOR_MULTIAXIS_OVERSIZE_MM.
+        # All dimensions are <= max_dim, but 3 dimensions are > MAX_DIM_FOR_MULTIAXIS_MM.
         # Cut along the largest dimension overall.
         cut_axis = np.argmax(dims)
-        cut_reason = f"{num_dims_over_multiaxis_limit} dimensions exceed {MAX_DIM_FOR_MULTIAXIS_OVERSIZE_MM}mm"
+        cut_reason = f"{num_dims_over_multiaxis_limit} dimensions exceed {MAX_DIM_FOR_MULTIAXIS_MM}mm"
     
     if not needs_cutting:
         print(f"DEBUG_PS: No cut needed for mesh at depth {current_depth} (dims: {dims}). Conditions not met. Returning as single part.")
@@ -563,138 +608,284 @@ def recursively_cut_mesh(mesh, max_dim, current_depth=0):
     # If slicing is successful, it returns the result of recursive calls.
     return [] # Should ideally not be reached if logic is correct
 
+def perform_angled_cuts(original_mesh, file_naming_prefix, base_output_path_for_this_mesh, angle_deg=45.0):
+    """
+    Performs angled cuts on the mesh relative to XY, XZ, YZ planes.
+    The mesh is expected to be preprocessed (OBB aligned and translated to origin).
+    Outputs will be organized into subdirectories within base_output_path_for_this_mesh.
+    file_naming_prefix is used for the actual .stl filenames.
+    """
+    print(f"DEBUG_PS: Performing angled cuts ({angle_deg} degrees) for files prefixed '{file_naming_prefix}', output to subdirs of '{base_output_path_for_this_mesh}'")
+    
+    angle_rad = math.radians(angle_deg)
+    s = math.sin(angle_rad) # sin(45)
+    c = math.cos(angle_rad) # cos(45)
+
+    # Define cut configurations: { plane_name: [(cut_name, normal_vector), ...], ... }
+    # Normals are for planes tilted 45-degrees relative to principal planes.
+    cut_configurations = {
+        "XY_plane_cuts": [ # Base normal was Z-axis [0,0,1]
+            ("rot_X_pos45deg", np.array([0, -s, c])), # Rotated around X-axis by +45 deg
+            ("rot_X_neg45deg", np.array([0, s, c])),  # Rotated around X-axis by -45 deg
+            ("rot_Y_pos45deg", np.array([s, 0, c])),  # Rotated around Y-axis by +45 deg
+            ("rot_Y_neg45deg", np.array([-s, 0, c])), # Rotated around Y-axis by -45 deg
+        ],
+        "XZ_plane_cuts": [ # Base normal was Y-axis [0,1,0]
+            ("rot_X_pos45deg", np.array([0, c, s])), 
+            ("rot_X_neg45deg", np.array([0, c, -s])),
+            ("rot_Z_pos45deg", np.array([-s, c, 0])),
+            ("rot_Z_neg45deg", np.array([s, c, 0])),
+        ],
+        "YZ_plane_cuts": [ # Base normal was X-axis [1,0,0]
+            ("rot_Y_pos45deg", np.array([c, 0, -s])),
+            ("rot_Y_neg45deg", np.array([c, 0, s])),
+            ("rot_Z_pos45deg", np.array([c, s, 0])),
+            ("rot_Z_neg45deg", np.array([c, -s, 0])),
+        ]
+    }
+
+    mesh_to_cut = original_mesh # Assume it's already preprocessed
+    cut_origin = mesh_to_cut.center_mass 
+    # Alternative: cut_origin = mesh_to_cut.bounds.mean(axis=0) # Geometric center of AABB
+
+    for plane_type, configs in cut_configurations.items():
+        plane_output_dir = os.path.join(base_output_path_for_this_mesh, plane_type) # Use base_output_path_for_this_mesh
+        if not os.path.exists(plane_output_dir):
+            os.makedirs(plane_output_dir)
+            print(f"DEBUG_PS: Created directory: {plane_output_dir}")
+
+        for name, normal_vec in configs:
+            # Ensure normal is unit vector
+            norm = np.linalg.norm(normal_vec)
+            if norm < 1e-9: # Avoid division by zero for a zero vector
+                print(f"DEBUG_PS: Skipping cut {plane_type} - {name} due to zero normal vector.")
+                continue
+            normal_vec = normal_vec / norm
+            
+            print(f"DEBUG_PS:   Attempting cut: {plane_type} - {name} with normal {np.round(normal_vec,3)} at origin {np.round(cut_origin,3)}")
+
+            try:
+                p1_mesh_orig = trimesh.intersections.slice_mesh_plane(
+                    mesh=mesh_to_cut, plane_normal=normal_vec, plane_origin=cut_origin, cap=True)
+                p2_mesh_orig = trimesh.intersections.slice_mesh_plane(
+                    mesh=mesh_to_cut, plane_normal=-normal_vec, plane_origin=cut_origin, cap=True)
+
+                pieces_info = []
+
+                # Process p1_mesh_orig
+                if p1_mesh_orig and not p1_mesh_orig.is_empty and len(p1_mesh_orig.faces) >= 4:
+                    p1_mesh_orig.process() # Ensure mesh is processed before validation
+                    is_substantial = p1_mesh_orig.volume > MIN_VOLUME_FOR_SUBSTANTIAL_PART_ANGLED
+                    is_valid_flat_face_p1, _ = validate_part(p1_mesh_orig, f"{file_naming_prefix}_{name}_p1", max_dim=MAX_DIM, min_flat_face_dim=MIN_FLAT_FACE_DIMENSION_MM)
+                    pieces_info.append({
+                        "mesh": p1_mesh_orig, 
+                        "name_suffix": "_p1", 
+                        "is_substantial": is_substantial, 
+                        "is_valid_flat_face": is_valid_flat_face_p1
+                    })
+                elif p1_mesh_orig:
+                    print(f"DEBUG_PS:   Skipping p1 from {name} as it's empty or has too few faces ({len(p1_mesh_orig.faces) if p1_mesh_orig else 'None'}).")
+
+                # Process p2_mesh_orig
+                if p2_mesh_orig and not p2_mesh_orig.is_empty and len(p2_mesh_orig.faces) >= 4:
+                    p2_mesh_orig.process() # Ensure mesh is processed before validation
+                    is_substantial = p2_mesh_orig.volume > MIN_VOLUME_FOR_SUBSTANTIAL_PART_ANGLED
+                    is_valid_flat_face_p2, _ = validate_part(p2_mesh_orig, f"{file_naming_prefix}_{name}_p2", max_dim=MAX_DIM, min_flat_face_dim=MIN_FLAT_FACE_DIMENSION_MM)
+                    pieces_info.append({
+                        "mesh": p2_mesh_orig, 
+                        "name_suffix": "_p2", 
+                        "is_substantial": is_substantial, 
+                        "is_valid_flat_face": is_valid_flat_face_p2
+                    })
+                elif p2_mesh_orig:
+                    print(f"DEBUG_PS:   Skipping p2 from {name} as it's empty or has too few faces ({len(p2_mesh_orig.faces) if p2_mesh_orig else 'None'}).")
+
+                all_substantial_pieces_valid = True
+                substantial_pieces_exist = any(p_info["is_substantial"] for p_info in pieces_info)
+
+                if not substantial_pieces_exist:
+                    all_substantial_pieces_valid = False
+                    print(f"DEBUG_PS:     Cut {plane_type} - {name}: No substantial pieces produced (volume <= {MIN_VOLUME_FOR_SUBSTANTIAL_PART_ANGLED} or <4 faces).")
+                else:
+                    for piece_data in pieces_info:
+                        if piece_data["is_substantial"] and not piece_data["is_valid_flat_face"]:
+                            all_substantial_pieces_valid = False
+                            part_identifier = f"{file_naming_prefix}_{name}_{piece_data['name_suffix']}"
+                            print(f"DEBUG_PS:     Substantial piece {part_identifier} FAILED flat face validation. Marking cut {name} as invalid.")
+                            break 
+
+                if all_substantial_pieces_valid and substantial_pieces_exist:
+                    print(f"DEBUG_PS:   VALID cut: {plane_type} - {name}. All substantial pieces passed validation.")
+                    for piece_data in pieces_info: 
+                        if piece_data["mesh"] and not piece_data["mesh"].is_empty:
+                            out_path = os.path.join(plane_output_dir, f"{file_naming_prefix}_{name}_{piece_data['name_suffix']}.stl")
+                            piece_data["mesh"].export(out_path)
+                            print(f"Saved VALID output part: {piece_data['name_suffix']} to {os.path.abspath(out_path)}")
+                else:
+                    reason = "one or more substantial pieces failed validation" if substantial_pieces_exist else "no substantial pieces were produced or met criteria"
+                    print(f"DEBUG_PS:   INVALID cut: {plane_type} - {name}. Reason: {reason}.")
+                    failed_dir = os.path.join(plane_output_dir, "failed_cuts_due_to_flat_face")
+                    if not os.path.exists(failed_dir):
+                        os.makedirs(failed_dir)
+                    
+                    for piece_data in pieces_info:
+                         if piece_data["mesh"] and not piece_data["mesh"].is_empty:
+                            out_path = os.path.join(failed_dir, f"{file_naming_prefix}_{name}_{piece_data['name_suffix']}_FAILED_VALIDATION.stl")
+                            piece_data["mesh"].export(out_path)
+                            print(f"Saved FAILED (validation) output part: {piece_data['name_suffix']} to {os.path.abspath(out_path)}")
+                         elif piece_data["mesh"]:
+                             print(f"DEBUG_PS:     {piece_data['name_suffix']} for {name} was empty, not saved to failed_cuts.")
+            
+            except Exception as e:
+                print(f"DEBUG_PS:     Error during slicing or validation for {plane_type} - {name}: {e}")
+                import traceback
+                print(traceback.format_exc(), flush=True)
+
+    print(f"DEBUG_PS: Finished angled cuts for files prefixed '{file_naming_prefix}'")
 
 def main():
     global OUTPUT_DIR # Declare OUTPUT_DIR as global to modify it
+    print("DEBUG_PS: main() function started.", flush=True) 
+    sys.stdout.flush() # Explicitly flush stdout
+    sys.stderr.flush() # Explicitly flush stderr
 
     parser = argparse.ArgumentParser(description="Process STL files to find parts with specific flat faces.")
-    parser.add_argument("input_stl", help="Input STL file to process.")
-    parser.add_argument("--output_dir", help="Directory to save output parts.", default="output_parts")
+    # Make input_stl optional by changing its definition in the parser
+    parser.add_argument("input_stl", nargs='?', help="Input STL file to process (optional if --run_angled_tests is used).")
+    parser.add_argument("--output_dir", help="Base directory to save output parts.", default="output_parts") # Clarified help
     parser.add_argument("--max_dim", type=float, help="Maximum dimension for cutting (default: 150.0 mm)", default=150.0)
     parser.add_argument("--min_flat_face_dim", type=float, help="Minimum flat face dimension (default: 8.0 mm)", default=8.0)
     parser.add_argument("--skip_manual_check", action="store_true", help="Skip manual inspection check for flat faces")
-    
-    args = parser.parse_args()
+    parser.add_argument("--run_angled_tests", action="store_true", help="Run predefined angled cutting tests on specific files.")
 
-    input_stl_path = args.input_stl
-    OUTPUT_DIR = args.output_dir # Set global output directory
+    args = parser.parse_args()
+    print(f"DEBUG_PS: Parsed arguments: {args}", flush=True) 
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    # Global settings from args
+    OUTPUT_DIR_BASE = args.output_dir
     MAX_DIM = args.max_dim
     MIN_FLAT_FACE_DIMENSION_MM = args.min_flat_face_dim
-
-    if not os.path.exists(input_stl_path):
-        print(f"Error: Input STL file not found: {input_stl_path}")
-        sys.exit(1)
-
-    print(f"Loading STL file: {input_stl_path}")
-    try:
-        mesh = trimesh.load_mesh(input_stl_path, process=True) # Ensure processing on load
-    except Exception as e:
-        print(f"Error loading STL file: {e}")
-        sys.exit(1)
     
-    if not mesh.is_watertight:
-        print("Warning: Initial mesh is not watertight. Attempting to fill holes.")
-        mesh.fill_holes()
-        if not mesh.is_watertight:
-            print("Error: Could not make initial mesh watertight. Exiting.")
+    OUTPUT_DIR = OUTPUT_DIR_BASE 
+    if not os.path.exists(OUTPUT_DIR_BASE):
+        os.makedirs(OUTPUT_DIR_BASE)
+        print(f"DEBUG_PS: Created base output directory: {OUTPUT_DIR_BASE}")
+
+    files_processed_by_angled_tests = set()
+
+    if args.run_angled_tests:
+        print("DEBUG_PS: Running predefined angled cutting tests...")
+        test_files = ["two-wall.stl", "two-wall-90degree.stl"]
+        root_angled_output_dir_for_all_tests = os.path.join(OUTPUT_DIR_BASE, "angled_test_runs") 
+        if not os.path.exists(root_angled_output_dir_for_all_tests):
+            os.makedirs(root_angled_output_dir_for_all_tests)
+            print(f"DEBUG_PS: Created root directory for all angled test runs: {root_angled_output_dir_for_all_tests}")
+
+        for stl_filename in test_files:
+            full_input_stl_path = os.path.join("c:\\repo\\voxel2", stl_filename) 
+            if not os.path.exists(full_input_stl_path):
+                print(f"Error: Test STL file not found: {full_input_stl_path}")
+                continue
+
+            print(f"Loading test STL file for angled cuts: {full_input_stl_path}")
+            try:
+                mesh = trimesh.load_mesh(full_input_stl_path, process=True)
+            except Exception as e:
+                print(f"Error loading STL file {full_input_stl_path}: {e}")
+                continue
+            
+            if not mesh.is_watertight:
+                print(f"Warning: Mesh {stl_filename} is not watertight. Attempting to fill holes.")
+                mesh.fill_holes()
+                if not mesh.is_watertight:
+                    print(f"Error: Could not make mesh {stl_filename} watertight. Skipping angled cuts for this file.")
+                    continue
+            
+            print(f"DEBUG_PS: Preprocessing {stl_filename} for angled cuts...")
+            obb_transform = mesh.bounding_box_oriented.transform
+            mesh.apply_transform(np.linalg.inv(obb_transform))
+            mesh.apply_translation(-mesh.bounds[0])
+            print(f"DEBUG_PS: {stl_filename} reoriented. New bounds: {mesh.bounds.round(3)}")
+
+            file_naming_prefix = os.path.splitext(stl_filename)[0]
+            base_output_path_for_this_mesh = os.path.join(root_angled_output_dir_for_all_tests, file_naming_prefix)
+            if not os.path.exists(base_output_path_for_this_mesh):
+                os.makedirs(base_output_path_for_this_mesh)
+
+            perform_angled_cuts(mesh, file_naming_prefix, base_output_path_for_this_mesh, angle_deg=45.0)
+            files_processed_by_angled_tests.add(stl_filename)
+        
+        print("DEBUG_PS: Angled cutting tests completed.")
+
+    should_run_standard_processing = False
+    if args.input_stl:
+        input_stl_basename = os.path.basename(args.input_stl)
+        if args.run_angled_tests and input_stl_basename in files_processed_by_angled_tests:
+            print(f"DEBUG_PS: Skipping standard processing for '{args.input_stl}' as its basename '{input_stl_basename}' was already processed by --run_angled_tests.")
+        else:
+            should_run_standard_processing = True
+            print(f"DEBUG_PS: Proceeding with standard processing for '{args.input_stl}'.")
+    elif not args.run_angled_tests:
+        parser.print_help()
+        print("\\nError: No input STL file provided and --run_angled_tests not specified.")
+        sys.exit(1)
+    else: 
+        print("DEBUG_PS: Angled tests completed. No separate input STL provided for standard processing. Exiting.")
+        sys.exit(0)
+
+    if should_run_standard_processing:
+        input_stl_path = args.input_stl
+
+        if not os.path.exists(input_stl_path):
+            print(f"Error: Input STL file for standard processing not found: {input_stl_path}")
             sys.exit(1)
 
-    print(f"DEBUG_PS: Original mesh center of mass: {mesh.center_mass}")
-    print(f"DEBUG_PS: Original mesh extents: {mesh.extents}")
-    
-    # Get the transform that aligns the OBB with the axes
-    # and apply its inverse to the mesh to achieve the alignment.
-    # This should make the mesh's OBB axis-aligned.
-    obb_transform = mesh.bounding_box_oriented.transform
-    mesh.apply_transform(np.linalg.inv(obb_transform))
-    # After this, the mesh.bounds should be equivalent to its OBB extents
-    # and its axes should be aligned with the world axes.
-    # It's also good to move the mesh to origin based on its new bounds for consistency.
-    mesh.apply_translation(-mesh.bounds[0])
-
-    print("DEBUG_PS: Mesh reoriented using OBB alignment and translated to origin.")
-    print(f"DEBUG_PS: New mesh center of mass after OBB reorient and translate: {mesh.center_mass}") 
-    print(f"DEBUG_PS: New mesh extents after OBB reorient and translate: {mesh.extents}")
-    
-    # Apply a small uniform scaling if dimensions are extremely small, to avoid precision issues
-    # This is a heuristic and might need adjustment or removal depending on typical model scales
-    if np.any(mesh.extents < 0.1): # If any dimension is less than 0.1mm
-        print("Warning: Mesh has very small extents. Applying a small uniform scaling (x10) to potentially improve robustness.")
-        mesh.apply_scale(10)
-
-
-    print("Initial mesh loaded and preprocessed.")
-    print(f"Initial bounding box: Min {np.round(mesh.bounds[0],3)}, Max {np.round(mesh.bounds[1],3)}")
-    print(f"Initial dimensions: {np.round(mesh.extents,3)}")
-
-    base_name = os.path.splitext(os.path.basename(input_stl_path))[0]
-    output_dir = f"output_parts_{base_name}"
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    print(f"Output will be saved to: {output_dir}")
-
-    print(f"Starting recursive cutting process with MAX_DIMENSION = {MAX_DIM}mm...")
-    processed_parts = recursively_cut_mesh(mesh, MAX_DIM, 0)
-
-    print(f"\\nProcessing complete. Generated {len(processed_parts)} potential parts.")
-    
-    final_saved_parts_count = 0
-    failed_parts_count = 0
-
-    for i, part in enumerate(processed_parts):
-        part_name = f"part_{i+1}"
-        print(f"--- Validating and Saving {part_name} ---")
+        print(f"Loading STL file for standard processing: {input_stl_path}")
+        try:
+            mesh = trimesh.load_mesh(input_stl_path, process=True)
+        except Exception as e:
+            print(f"Error loading STL file {input_stl_path}: {e}")
+            sys.exit(1)
         
-        # Ensure part is processed before validation, especially if it's an original uncut mesh
-        # or a part that didn't go through the full cutting path that processes sub-parts.
-        if not hasattr(part, 'facets') or part.facets is None: # A simple check
-            part.process()
-        if not part.is_watertight: # Attempt to fix if it became non-watertight
-            # print(f"  Warning: Part {part_name} is not watertight before final validation. Attempting to fill.")
-            part.fill_holes()
-
-
-        is_valid, validation_messages = validate_part(part, part_name, max_dim=MAX_DIM, min_flat_face_dim=MIN_FLAT_FACE_DIMENSION_MM)
+        if not mesh.is_watertight:
+            print("Warning: Initial mesh for standard processing is not watertight. Attempting to fill holes.")
+            mesh.fill_holes()
+            if not mesh.is_watertight:
+                print(f"Error: Could not make initial mesh watertight. Exiting.")
+                sys.exit(1)
         
-        for msg in validation_messages:
-            print(msg)
+        print(f"DEBUG_PS: Preprocessing for standard processing...")
+        obb_transform = mesh.bounding_box_oriented.transform
+        mesh.apply_transform(np.linalg.inv(obb_transform))
+        mesh.apply_translation(-mesh.bounds[0])
+        print(f"DEBUG_PS: Standard processing reoriented. New bounds: {mesh.bounds.round(3)}")
 
+        is_valid, validation_messages = validate_part(mesh, "input_stl_validation", max_dim=MAX_DIM, min_flat_face_dim=MIN_FLAT_FACE_DIMENSION_MM)
+        
         if is_valid:
-            try:
-                output_stl_path = os.path.join(output_dir, f"{part_name}.stl")
-                part.export(output_stl_path)
-                print(f"Successfully saved: {output_stl_path}")
-                
-                # Post-save validation (optional, but good for sanity check)
-                # loaded_check_part = trimesh.load_mesh(output_stl_path, process=True)
-                # is_still_valid, check_msgs = validate_part(loaded_check_part, f"{part_name}_reloaded", MAX_DIM, MIN_FLAT_FACE_EDGE)
-                # if not is_still_valid:
-                #     print(f"--- {part_name} FAILED post-save validation. Issues: {check_msgs} ---")
-                # else:
-                #     print(f"--- {part_name} PASSED post-save validation. ---")
-                final_saved_parts_count += 1
-            except Exception as e:
-                print(f"Error saving part {part_name}: {e}")
-                failed_parts_count +=1
+            print(f"DEBUG_PS: Input STL mesh is valid. Proceeding with cutting.")
+            output_mesh_path = os.path.join(OUTPUT_DIR, "validated_input_mesh.stl")
+            mesh.export(output_mesh_path)
+            print(f"DEBUG_PS: Exported validated input mesh to: {output_mesh_path}")
         else:
-            failed_parts_count += 1
-            try:
-                failed_output_stl_path = os.path.join(output_dir, f"{part_name}_FAILED.stl")
-                part.export(failed_output_stl_path)
-                print(f"Saved FAILED part for inspection: {failed_output_stl_path}")
-            except Exception as e:
-                print(f"Error saving FAILED part {part_name}: {e}")
-            print(f"--- {part_name} FAILED validation. ---")
+            print(f"DEBUG_PS: Input STL mesh is not valid: {validation_messages}. Exiting.")
+            sys.exit(1)
 
-    print(f"\\nSummary: {final_saved_parts_count} parts saved successfully to '{output_dir}'.")
-    if failed_parts_count > 0:
-        print(f"{failed_parts_count} parts FAILED validation or saving.")
-
-    if final_saved_parts_count == 0 and len(processed_parts) > 0 :
-        print("\\nNo parts successfully met all validation criteria.")
-        print("The script attempts one pass of cutting. If validation fails for some parts,")
-        print("the cutting strategy within 'recursively_cut_mesh' or the validation logic in 'has_required_flat_face'")
-        print("might need further refinement for your specific STL model.")
+        print("DEBUG_PS: Standard processing completed.")
+    
+    print("DEBUG_PS: Program finished. Check output directories for results.")
+print("DEBUG_PS: Global variables and functions defined. Script execution reached end, before calling main.", flush=True)
 
 if __name__ == "__main__":
-    main()
+    print("DEBUG_PS: Entered __main__ block.", flush=True)
+    try:
+        print("DEBUG_PS: Inside __main__ block, attempting to call main().", flush=True)
+        main()
+        print("DEBUG_PS: main() call completed.", flush=True)
+    except Exception as e_main_call:
+        print(f"DEBUG_PS: Exception occurred calling or during main(): {e_main_call}", flush=True)
+        import traceback
+        print(traceback.format_exc(), flush=True)
+        sys.exit(1)
