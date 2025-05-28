@@ -1,11 +1,13 @@
 import argparse
-import numpy as np
 from scipy.ndimage import zoom, binary_erosion, generate_binary_structure
 from pyvox.models import Vox, Model
 from pyvox.parser import VoxParser
 from pyvox.writer import VoxWriter
 from stl import mesh
-import os
+import numpy as np # Ensure numpy is imported
+import os # For path operations
+import trimesh # For mesh processing
+from process_stl_parts import process_mesh_object # For advanced mesh processing
 
 CUTOUT_SIZE = 1 # Size of the cube to cut from each surface at the scaled resolution
 
@@ -288,7 +290,8 @@ def save_gapped_difference_stl(filepath,
                                scale_factor_int, 
                                stl_voxel_size_mm, 
                                gap_mm):
-    """Saves an STL of objects from difference_voxels, gapped by original grid."""
+    """Saves an STL of objects from difference_voxels, gapped by original grid,
+    with each object processed by process_mesh_object."""
     if not np.any(overall_difference_voxels_scaled) or not np.any(original_smallxels_bool):
         print(f"No difference voxels or original voxels to process for '{filepath}'. Skipping.")
         return False # Indicate no file saved
@@ -298,7 +301,7 @@ def save_gapped_difference_stl(filepath,
     S_vmm = stl_voxel_size_mm
 
     all_final_triangles = []
-    total_objects = 0
+    total_input_blocks = 0 
 
     for smx in range(sm_dx):
         for smy in range(sm_dy):
@@ -315,23 +318,87 @@ def save_gapped_difference_stl(filepath,
                 if not np.any(sub_diff_block):
                     continue
                 
-                total_objects += 1
+                total_input_blocks += 1
 
-                block_origin_x_mm = smx * (SF * S_vmm + gap_mm)
-                block_origin_y_mm = smy * (SF * S_vmm + gap_mm)
-                block_origin_z_mm = smz * (SF * S_vmm + gap_mm)
-                current_block_global_offset_mm = (block_origin_x_mm, block_origin_y_mm, block_origin_z_mm)
-
-                object_triangles = generate_triangles_for_voxel_block(
+                # 1. Generate initial triangles for the sub_diff_block (at origin, correct scale)
+                initial_block_triangles = generate_triangles_for_voxel_block(
                     sub_diff_block,
                     S_vmm,
-                    current_block_global_offset_mm
+                    (0.0, 0.0, 0.0) # Generate at local origin
                 )
-                all_final_triangles.extend(object_triangles)
+
+                if not initial_block_triangles:
+                    # print(f"Block at sm({smx},{smy},{smz}) generated no initial triangles. Skipping.") # Optional: verbose logging
+                    continue
+
+                # 2. Convert triangles to Trimesh object
+                all_block_vertices_list = []
+                all_block_faces_list = []
+                vertex_to_index_map = {}
+                next_vertex_idx = 0
+
+                for triangle in initial_block_triangles:
+                    current_face_indices = []
+                    for vertex_coords in triangle:
+                        vertex_tuple = tuple(vertex_coords) # Ensure hashable for dict key
+                        if vertex_tuple not in vertex_to_index_map:
+                            vertex_to_index_map[vertex_tuple] = next_vertex_idx
+                            all_block_vertices_list.append(list(vertex_coords))
+                            next_vertex_idx += 1
+                        current_face_indices.append(vertex_to_index_map[vertex_tuple])
+                    all_block_faces_list.append(current_face_indices)
+                
+                if not all_block_vertices_list or not all_block_faces_list:
+                    # print(f"Block at sm({smx},{smy},{smz}) resulted in no vertices/faces for Trimesh. Skipping.") # Optional
+                    continue
+
+                try:
+                    initial_trimesh_obj = trimesh.Trimesh(
+                        vertices=np.array(all_block_vertices_list),
+                        faces=np.array(all_block_faces_list)
+                    )
+                    # Check if the created mesh is valid enough for processing
+                    if initial_trimesh_obj.is_empty or initial_trimesh_obj.volume < 1e-9:
+                        # print(f"Block at sm({smx},{smy},{smz}) created an empty or non-volumetric Trimesh object. Skipping processing for this block.") # Optional
+                        continue
+                except Exception as e:
+                    print(f"Error creating Trimesh object for block at sm({smx},{smy},{smz}): {e}. Skipping.")
+                    continue
+                
+                # 3. Process the Trimesh object
+                part_base_name = f"{os.path.splitext(os.path.basename(filepath))[0]}_sm{smx}_{smy}_{smz}"
+                
+                processed_meshes, cut_type = process_mesh_object(
+                    initial_trimesh_obj,
+                    part_base_name,
+                    run_three_wall_flag=False # Allow auto-detection of cut type
+                )
+
+                # 4. Add triangles from processed meshes to all_final_triangles, applying global offset
+                if processed_meshes:
+                    block_origin_x_mm = smx * (SF * S_vmm + gap_mm)
+                    block_origin_y_mm = smy * (SF * S_vmm + gap_mm)
+                    block_origin_z_mm = smz * (SF * S_vmm + gap_mm)
+                    current_block_global_offset_mm = np.array([block_origin_x_mm, block_origin_y_mm, block_origin_z_mm])
+
+                    for proc_mesh in processed_meshes:
+                        if proc_mesh and not proc_mesh.is_empty:
+                            # Ensure proc_mesh.vertices and proc_mesh.faces are valid
+                            if proc_mesh.vertices is not None and len(proc_mesh.vertices) > 0 and \
+                               proc_mesh.faces is not None and len(proc_mesh.faces) > 0:
+                                
+                                transformed_vertices = proc_mesh.vertices + current_block_global_offset_mm
+                                for face_indices_in_proc_mesh in proc_mesh.faces:
+                                    all_final_triangles.append(transformed_vertices[face_indices_in_proc_mesh].tolist())
+                            # else: # Optional: verbose logging for invalid processed parts
+                                # print(f"Processed mesh part from {part_base_name} (cut type: {cut_type}) is invalid (no vertices/faces). Skipping this part.")
+                # else: # Optional: verbose logging for blocks that yield no processed meshes
+                    # print(f"Processing of block {part_base_name} (sm({smx},{smy},{smz})) with process_mesh_object (cut type: {cut_type}) yielded no meshes.")
+
 
     if not all_final_triangles:
-        print(f"No actual mesh objects to save in '{filepath}' after processing differences. Skipping.")
-        return False # Indicate no file saved
+        print(f"No actual mesh objects to save in '{filepath}' after processing {total_input_blocks} input blocks. Skipping.")
+        return False
 
     num_triangles = len(all_final_triangles)
     final_mesh_obj = mesh.Mesh(np.zeros(num_triangles, dtype=mesh.Mesh.dtype))
@@ -339,8 +406,8 @@ def save_gapped_difference_stl(filepath,
         final_mesh_obj.vectors[i] = triangle_vertices
     
     final_mesh_obj.save(filepath)
-    print(f"Saved gapped difference STL to '{filepath}' with {total_objects} objects ({num_triangles} triangles). Gap: {gap_mm}mm.")
-    return True # Indicate file saved
+    print(f"Saved gapped difference STL to '{filepath}' from {total_input_blocks} input blocks, resulting in {num_triangles} triangles. Gap: {gap_mm}mm.")
+    return True
 
 def save_vox_file(filepath, voxel_data_bool, original_palette):
     """Saves the boolean voxel data to a .vox file, clipping if dimensions exceed 255."""
@@ -484,7 +551,7 @@ def main():
     parser = argparse.ArgumentParser(description="Scale, erode .vox files, and save as .vox and .stl.")
     parser.add_argument("input_vox_file", help="Path to the input .vox file (e.g., scene.vox).")
     parser.add_argument("--scale_factor", type=float, default=10.0, help="Factor to scale voxels by (default: 10.0).")
-    parser.add_argument("--erosion_voxels", type=int, default=1, help="Number of voxel layers to erode after scaling (default: 2).")
+    parser.add_argument("--erosion_voxels", type=int, default=1, help="Number of voxel layers to erode after scaling (default: 1).")
     
     args = parser.parse_args()
 
