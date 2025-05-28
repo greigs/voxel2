@@ -1,4 +1,16 @@
 import sys
+import os
+import argparse
+import numpy as np
+import trimesh
+import math
+import logging
+import time
+import shutil
+from scipy.spatial import ConvexHull, Delaunay # Keep existing scipy imports
+from collections import deque
+from itertools import combinations # ADDED import
+
 print("DEBUG_PS: Python interpreter started, sys imported.", flush=True)
 
 try:
@@ -46,10 +58,99 @@ OUTPUT_DIR = "" # Initialize globally, will be set in main
 
 MIN_VOLUME_CUT_PIECE_MM3 = 0.5  # Minimum volume for a piece to be considered substantial after a cut
 MIN_FACES_CUT_PIECE = 4      # Minimum faces for a piece
-MIN_VOLUME_FOR_SUBSTANTIAL_PART_ANGLED = 1.0 # For angled cuts
+# MIN_VOLUME_FOR_SUBSTANTIAL_PART_ANGLED = 1.0 # For angled cuts # Removed duplicate
 
 # Core helper functions for validation and cutting logic START
 # (This block replaces stubs or missing definitions for these functions)
+
+def detect_three_wall_corner_candidate(mesh, min_dim=MIN_FLAT_FACE_DIMENSION_MM, fill_ratio_threshold=FLAT_FACE_FILL_RATIO, normal_alignment_tolerance=FLAT_FACE_NORMAL_TOLERANCE):
+    """
+    Detects if the OBB-aligned mesh is a candidate for three-wall corner cutting.
+    Checks for three large, flat, mutually orthogonal faces aligned with X, Y, Z axes.
+    """
+    if mesh is None or mesh.is_empty:
+        print("DEBUG_DTWCC: Mesh is empty.", flush=True)
+        return False
+    
+    try:
+        _ = mesh.facets # Trigger facet computation
+        if not hasattr(mesh, 'facets_normal') or mesh.facets_normal is None or len(mesh.facets_normal) == 0:
+            print("DEBUG_DTWCC: Mesh has no facets or facet normals after attempting to compute facets.", flush=True)
+            return False
+    except Exception as e:
+        print(f"DEBUG_DTWCC: Exception during facet computation: {e}", flush=True)
+        return False
+
+    print(f"DEBUG_DTWCC: Starting detection. Mesh has {len(mesh.facets_normal)} facets. Min_dim: {min_dim}, Fill_ratio: {fill_ratio_threshold}, Normal_tolerance: {normal_alignment_tolerance}", flush=True)
+
+    found_axis_faces = [False, False, False]  # X, Y, Z
+    principal_axis_vectors_abs = [np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0])]
+
+    for facet_idx, facet_normal in enumerate(mesh.facets_normal):
+        abs_facet_normal = np.abs(facet_normal)
+        aligned_axis_index = -1
+
+        for i in range(3): # 0 for X, 1 for Y, 2 for Z
+            # Check if the absolute normal is close to a principal axis vector
+            if np.allclose(abs_facet_normal, principal_axis_vectors_abs[i], atol=normal_alignment_tolerance):
+                aligned_axis_index = i
+                break
+        
+        if aligned_axis_index != -1 and not found_axis_faces[aligned_axis_index]:
+            facet_face_indices = mesh.facets[facet_idx]
+            if not isinstance(facet_face_indices, (list, np.ndarray)) or len(facet_face_indices) == 0:
+                continue
+
+            actual_facet_area = np.sum(mesh.area_faces[facet_face_indices])
+            
+            if actual_facet_area < (min_dim * min_dim * 0.5): # Heuristic pre-filter
+                continue
+
+            facet_vertex_indices = np.unique(mesh.faces[facet_face_indices].flatten())
+            facet_vertices = mesh.vertices[facet_vertex_indices]
+
+            if len(facet_vertices) < 3:
+                continue
+            
+            # Project facet vertices onto the plane defined by its normal to get 2D dimensions
+            plane_origin = facet_vertices[0]
+            transform_to_xy_plane = trimesh.geometry.plane_transform(origin=plane_origin, normal=facet_normal)
+            x_axis_direction_plane = transform_to_xy_plane[0, :3]
+            y_axis_direction_plane = transform_to_xy_plane[1, :3]
+            
+            vectors_from_origin = facet_vertices - plane_origin
+            projected_coords_x = np.dot(vectors_from_origin, x_axis_direction_plane)
+            projected_coords_y = np.dot(vectors_from_origin, y_axis_direction_plane)
+            
+            projected_vertices_2d = np.column_stack((projected_coords_x, projected_coords_y))
+            
+            min_2d = np.min(projected_vertices_2d, axis=0)
+            max_2d = np.max(projected_vertices_2d, axis=0)
+            dims_2d = max_2d - min_2d
+            
+            bounding_box_area_2d = dims_2d[0] * dims_2d[1]
+            if bounding_box_area_2d < 1e-9: # Avoid division by zero or tiny areas
+                continue
+            
+            current_fill_ratio = actual_facet_area / bounding_box_area_2d
+
+            if dims_2d[0] >= min_dim and dims_2d[1] >= min_dim and current_fill_ratio >= fill_ratio_threshold:
+                axis_name = ['X', 'Y', 'Z'][aligned_axis_index]
+                print(f"DEBUG_DTWCC: Found qualifying facet for axis {axis_name} (idx {aligned_axis_index}). Normal: {facet_normal}, Dims: {dims_2d}, Area: {actual_facet_area:.2f}, Fill: {current_fill_ratio:.2f}", flush=True)
+                found_axis_faces[aligned_axis_index] = True
+                if all(found_axis_faces):
+                    print("DEBUG_DTWCC: Found qualifying orthogonal faces for all three principal axes (X, Y, Z). Candidate detected.", flush=True)
+                    return True
+            # else: # Optional: for debugging facets that are axis-aligned but don't meet size/fill
+                # axis_name_debug = ['X', 'Y', 'Z'][aligned_axis_index]
+                # print(f"DEBUG_DTWCC: Facet for axis {axis_name_debug} (idx {aligned_axis_index}) did not meet size/fill. Dims: {dims_2d}, Fill: {current_fill_ratio:.2f}, Actual Area: {actual_facet_area:.2f}, BBox Area: {bounding_box_area_2d:.2f}", flush=True)
+
+
+    if any(found_axis_faces):
+        print(f"DEBUG_DTWCC: Found some axis-aligned faces but not all three. X: {found_axis_faces[0]}, Y: {found_axis_faces[1]}, Z: {found_axis_faces[2]}", flush=True)
+    else:
+        print("DEBUG_DTWCC: Did not find any qualifying large axis-aligned faces.", flush=True)
+    return False
 
 def has_required_flat_face(part_mesh, min_flat_face_dim=8.0):
     """
@@ -69,11 +170,13 @@ def has_required_flat_face(part_mesh, min_flat_face_dim=8.0):
     # Ensure facets are computed.
     if not hasattr(part_mesh, 'facets') or not part_mesh.facets:
         try:
-            part_mesh.process() # This should compute facets
+            _ = part_mesh.facets # Attempt to compute facets
         except Exception as e:
-            return False, f"Error processing mesh for facets: {e}"
-        if not hasattr(part_mesh, 'facets') or not part_mesh.facets:
-            return False, "No facets found in mesh even after process()."
+            print(f"DEBUG_HRFF: Exception computing facets for part: {e}", flush=True)
+            # If facets still not available, return False as we can't check them
+        if not hasattr(part_mesh, 'facets') or not part_mesh.facets or not hasattr(part_mesh, 'facets_normal') or not part_mesh.facets_normal:
+            print("DEBUG_HRFF: Facets or facet_normals still not available after attempt.", flush=True)
+            return False, "Facets could not be computed for flat face check."
 
 
     min_area_required = min_flat_face_dim * min_flat_face_dim
@@ -115,13 +218,13 @@ def has_required_flat_face(part_mesh, min_flat_face_dim=8.0):
         if dims_2d[0] >= min_flat_face_dim and dims_2d[1] >= min_flat_face_dim:
             bbox_area_2d = dims_2d[0] * dims_2d[1]
             if bbox_area_2d == 0:
-                continue
+                continue # Avoid division by zero
             
             fill_ratio = actual_facet_area / bbox_area_2d
             
             if fill_ratio >= fill_ratio_threshold:
-                print(f"DEBUG_HRFF: Found valid flat face on facet {facet_idx} for mesh being validated. Area {actual_facet_area:.2f}, Dims {dims_2d[0]:.2f}x{dims_2d[1]:.2f}, Fill ratio {fill_ratio:.2f}") # MODIFIED: Uncommented and ensured it prints useful info
-                return True, "Found required flat face."
+                print(f"DEBUG_HRFF: Found valid flat face on facet {facet_idx} for mesh being validated. Area {actual_facet_area:.2f}, Dims {dims_2d[0]:.2f}x{dims_2d[1]:.2f}, Fill ratio {fill_ratio:.2f}", flush=True)
+                return True, f"Found flat face: Area {actual_facet_area:.2f}, Dims {dims_2d[0]:.2f}x{dims_2d[1]:.2f}, Fill {fill_ratio:.2f}"
 
     return False, f"No flat rectangular face >= {min_flat_face_dim}x{min_flat_face_dim}mm with fill ratio >= {fill_ratio_threshold} found."
 
@@ -353,19 +456,15 @@ def perform_three_wall_corner_cuts(mesh, output_dir, original_filename_base):
                                 min_flat_face_dim=MIN_FLAT_FACE_DIMENSION_MM
                             )
                             if is_valid_final_piece:
-                                print(f"DEBUG_P3WCC: Final piece {part_final_filename} PASSED validation.")
+                                print(f"DEBUG_P3WCC: Final piece {part_final_filename} PASSED validation. {'; '.join(validation_msgs)}") # MODIFIED to include msgs
                                 try:
-                                    if piece_mesh_to_validate and not piece_mesh_to_validate.is_empty:
-                                        piece_mesh_to_validate.export(part_final_path)
-                                        print(f"Saved successfully validated corner cut part: {part_final_path}")
-                                        validated_and_saved_pieces_for_this_attempt.append(piece_mesh_to_validate)
-                                        temp_saved_filenames_for_this_attempt.append(part_final_path)
-                                    else:
-                                        print(f"ERROR_P3WCC: Validated piece {part_final_filename} is None or empty, cannot export.")
-                                        all_pieces_fully_validated = False; break
+                                    piece_mesh_to_validate.export(part_final_path)
+                                    print(f"Saved successfully validated corner cut part: {part_final_path}", flush=True)
+                                    validated_and_saved_pieces_for_this_attempt.append(piece_mesh_to_validate)
+                                    temp_saved_filenames_for_this_attempt.append(part_final_path)
                                 except Exception as e_export_final:
-                                    print(f"ERROR_P3WCC: Failed to export validated piece {part_final_filename}: {e_export_final}")
-                                    all_pieces_fully_validated = False; break 
+                                    print(f"ERROR_P3WCC: Failed to export validated piece {part_final_filename}: {e_export_final}", flush=True)
+                                    all_pieces_fully_validated = False; break # If save fails, it's a failure for this strategy
                             else:
                                 print(f"DEBUG_P3WCC: Final piece {part_final_filename} (from {validation_part_desc}) FAILED validation: {'; '.join(validation_msgs)}. Strategy C{corner_idx}{filename_suffix_realignment_indicator}_Ax{first_cut_axis}{second_cut_axis} failed for this piece.")
                                 all_pieces_fully_validated = False; break 
@@ -380,10 +479,12 @@ def perform_three_wall_corner_cuts(mesh, output_dir, original_filename_base):
                             status_overall = "VALIDATION_FAILED"
                             for f_path in temp_saved_filenames_for_this_attempt:
                                 if os.path.exists(f_path):
-                                    try: os.remove(f_path); print(f"DEBUG_P3WCC: Cleaned up: {f_path}")
-                                    except Exception as e_clean: print(f"ERROR_P3WCC: Failed to clean up {f_path}: {e_clean}")
+                                    try:
+                                        os.remove(f_path)
+                                        print(f"DEBUG_P3WCC: Cleaned up: {f_path}", flush=True)
+                                    except Exception as e_cleanup:
+                                        print(f"ERROR_P3WCC: Failed to clean up {f_path}: {e_cleanup}", flush=True)
                             # Continue to the next second_cut_axis or realignment attempt
-                    
                     elif status in ["FIRST_CUT_INEFFECTIVE_SUBSTANTIAL", "FIRST_CUT_INEFFECTIVE_VOLUME_RATIO"]:
                         print(f"DEBUG_P3WCC: First cut ineffective (status: {status}) for C{corner_idx}{filename_suffix_realignment_indicator}, Axis {first_cut_axis}.")
                         if attempt_count == 0: break # Break from second_cut_axis loop to go to realignment attempt
@@ -406,7 +507,94 @@ def perform_three_wall_corner_cuts(mesh, output_dir, original_filename_base):
     print(f"DEBUG_P3WCC: No successful three-wall cutting strategy found for {original_filename_base} after checking all combinations.", flush=True) # ADDED flush
     return []
 
-# Core helper functions for validation and cutting logic END
+def perform_standard_angled_cut(mesh_to_cut, output_dir_angled, original_filename_base):
+    print(f"DEBUG_PSAC: Starting standard angled cut for {original_filename_base}", flush=True)
+    mesh_copy = mesh_to_cut.copy()
+    if mesh_copy.is_empty:
+        print("DEBUG_PSAC: Input mesh is empty.", flush=True)
+        return []
+
+    potential_normals = [
+        np.array([1.0, 1.0, 0.0]),
+        np.array([1.0, -1.0, 0.0]),
+        np.array([1.0, 0.0, 1.0]),
+        np.array([1.0, 0.0, -1.0]),
+        np.array([0.0, 1.0, 1.0]),
+        np.array([0.0, 1.0, -1.0]),
+    ]
+
+    plane_origin = mesh_copy.center_mass
+    print(f"DEBUG_PSAC: Using plane origin (center_mass): {plane_origin}", flush=True)
+
+    for i, normal_vec in enumerate(potential_normals):
+        # Normalize the normal vector
+        norm = np.linalg.norm(normal_vec)
+        if norm == 0: # Should not happen with predefined normals
+            continue
+        plane_normal = normal_vec / norm
+        
+        print(f"DEBUG_PSAC: Attempting cut {i+1} with normal: {plane_normal}", flush=True)
+
+        try:
+            # Slice the mesh
+            part1 = trimesh.intersections.slice_mesh_plane(mesh_copy, plane_normal=plane_normal, plane_origin=plane_origin, cap=True)
+            part2 = trimesh.intersections.slice_mesh_plane(mesh_copy, plane_normal=-plane_normal, plane_origin=plane_origin, cap=True)
+        except Exception as e:
+            print(f"ERROR_PSAC: slice_mesh_plane failed for normal {plane_normal}: {e}", flush=True)
+            continue
+
+        if not part1 or part1.is_empty or not part2 or part2.is_empty:
+            print(f"DEBUG_PSAC: Cut {i+1} (normal: {plane_normal}) resulted in one or more empty pieces.", flush=True)
+            continue
+        
+        # Validate pieces using the existing validate_part function
+        # Default min_flat_face_dim from MIN_FLAT_FACE_DIMENSION_MM (8.0) will be used.
+        # This might be strict for angled faces, but parts might retain other original flat faces.
+        
+        part1_name = f"{original_filename_base}_angled_cut{i+1}_p1"
+        is_valid1, msgs1 = validate_part(part1, part1_name) # Using default min_flat_face_dim
+        if not is_valid1:
+            print(f"DEBUG_PSAC: Part 1 ({part1_name}) from cut {i+1} is NOT valid. Reasons: {'; '.join(msgs1)}", flush=True)
+            continue # Try next normal if part1 is invalid
+
+        part2_name = f"{original_filename_base}_angled_cut{i+1}_p2"
+        is_valid2, msgs2 = validate_part(part2, part2_name) # Using default min_flat_face_dim
+        if not is_valid2:
+            print(f"DEBUG_PSAC: Part 2 ({part2_name}) from cut {i+1} is NOT valid. Reasons: {'; '.join(msgs2)}", flush=True)
+            continue # Try next normal if part2 is invalid
+
+        # If both parts are valid
+        print(f"DEBUG_PSAC: Cut {i+1} with normal {plane_normal} successful. Produced 2 valid pieces.", flush=True)
+        print(f"DEBUG_PSAC: Part 1 ({part1_name}) validation: {'; '.join(msgs1)}", flush=True)
+        print(f"DEBUG_PSAC: Part 2 ({part2_name}) validation: {'; '.join(msgs2)}", flush=True)
+        
+        saved_pieces_paths = []
+        try:
+            path1 = os.path.join(output_dir_angled, f"{part1_name}.stl")
+            part1.export(path1)
+            print(f"DEBUG_PSAC: Saved angled cut part: {path1}", flush=True)
+            saved_pieces_paths.append(path1)
+
+            path2 = os.path.join(output_dir_angled, f"{part2_name}.stl")
+            part2.export(path2)
+            print(f"DEBUG_PSAC: Saved angled cut part: {path2}", flush=True)
+            saved_pieces_paths.append(path2)
+            
+            return [part1, part2] # Return the mesh objects
+        except Exception as e_export:
+            print(f"ERROR_PSAC: Failed to export angled cut pieces for cut {i+1}: {e_export}", flush=True)
+            for p_path in saved_pieces_paths: # Corrected variable name here
+                if os.path.exists(p_path):
+                    try:
+                        os.remove(p_path)
+                        print(f"DEBUG_PSAC: Cleaned up partially saved file: {p_path}", flush=True)
+                    except Exception as e_cleanup:
+                        print(f"ERROR_PSAC: Failed to clean up {p_path}: {e_cleanup}", flush=True)
+            # Continue to the next normal even if export fails for this one
+            continue 
+
+    print(f"DEBUG_PSAC: No successful standard angled cut found for {original_filename_base} after trying all predefined normals.", flush=True)
+    return []
 
 # def _evaluate_candidate_cut(original_mesh_to_slice, plane_normal, plane_origin, cut_description, current_depth):
 # ... existing code ...
@@ -455,36 +643,77 @@ def main():
     mesh.apply_translation(translation_to_origin)
     print(f"DEBUG_MAIN: Mesh translated by {translation_to_origin} so min corner is at origin. New bounds: {mesh.bounds}", flush=True) # ADDED flush
 
+    # Ensure facets are computed on the preprocessed mesh before detection or cutting
+    try:
+        _ = mesh.facets # This line triggers facet computation
+        if not hasattr(mesh, 'facets_normal') or mesh.facets_normal is None or len(mesh.facets_normal) == 0:
+             print("DEBUG_MAIN: Facets or facet_normals not available on preprocessed mesh after attempting computation.", flush=True)
+    except Exception as e:
+        print(f"ERROR_MAIN: Could not ensure/compute facets on preprocessed mesh: {e}", flush=True)
+
+    auto_detected_three_wall_candidate = False
+    # Only attempt auto-detection if the flag is NOT explicitly set.
+    if not args.run_three_wall_corner_cuts:
+        print("DEBUG_MAIN: --run_three_wall_corner_cuts is FALSE. Attempting auto-detection of three-wall candidate.", flush=True)
+        # Pass the preprocessed mesh to the detection function
+        if detect_three_wall_corner_candidate(mesh, min_dim=MIN_FLAT_FACE_DIMENSION_MM, fill_ratio_threshold=FLAT_FACE_FILL_RATIO, normal_alignment_tolerance=FLAT_FACE_NORMAL_TOLERANCE):
+            print("DEBUG_MAIN: Auto-detected as a three-wall corner candidate.", flush=True)
+            auto_detected_three_wall_candidate = True # Variable defined
+        else:
+            print("DEBUG_MAIN: Not auto-detected as a three-wall corner candidate.", flush=True)
+            auto_detected_three_wall_candidate = False # Ensure it's defined in this path too
+    else:
+        auto_detected_three_wall_candidate = False # Ensure it's defined if flag is true
 
     three_wall_cuts_successful = False
-    if args.run_three_wall_corner_cuts:
-        print(f"DEBUG_MAIN: --run_three_wall_corner_cuts is TRUE. Attempting three-wall corner cuts for {original_filename_base}", flush=True) # ADDED flush
+    # Determine if the three-wall cutting process should be run
+    should_run_three_wall_cuts = args.run_three_wall_corner_cuts or auto_detected_three_wall_candidate
+
+    if should_run_three_wall_cuts:
+        if args.run_three_wall_corner_cuts:
+            # This covers: flag is true, auto_detect might be true or false (doesn't matter, flag takes precedence)
+            print(f"DEBUG_MAIN: --run_three_wall_corner_cuts is TRUE. Attempting three-wall corner cuts for {original_filename_base}", flush=True)
+        elif auto_detected_three_wall_candidate: # This implies flag is false and auto_detect is true
+            print(f"DEBUG_MAIN: Auto-detection triggered. Attempting three-wall corner cuts for {original_filename_base}", flush=True)
         
         corner_cuts_output_dir = os.path.join(base_output_dir_for_file, f"{original_filename_base}_corner_cuts")
         if not os.path.exists(corner_cuts_output_dir):
             os.makedirs(corner_cuts_output_dir)
-            print(f"DEBUG_MAIN: Created corner cuts output directory: {corner_cuts_output_dir}", flush=True) # ADDED flush
+            print(f"DEBUG_MAIN: Created corner cuts output directory: {corner_cuts_output_dir}", flush=True)
 
         resulting_pieces = perform_three_wall_corner_cuts(mesh, corner_cuts_output_dir, original_filename_base)
         
         if resulting_pieces and len(resulting_pieces) == 3:
-            print(f"DEBUG_MAIN: Three-wall corner cutting successful for {original_filename_base}. Found {len(resulting_pieces)} pieces.", flush=True) # ADDED flush
+            print(f"DEBUG_MAIN: Three-wall corner cutting successful for {original_filename_base}. Found {len(resulting_pieces)} pieces.", flush=True)
             three_wall_cuts_successful = True
         else:
-            print(f"DEBUG_MAIN: Three-wall corner cutting did not produce 3 validated pieces for {original_filename_base}.", flush=True) # ADDED flush
+            print(f"DEBUG_MAIN: Three-wall corner cutting did not produce 3 validated pieces for {original_filename_base}.", flush=True)
     else:
-        print("DEBUG_MAIN: --run_three_wall_corner_cuts is FALSE. Skipping three-wall corner cuts.", flush=True) # ADDED flush
+        # This else implies (NOT args.run_three_wall_corner_cuts AND NOT auto_detected_three_wall_corner_cuts)
+        print(f"DEBUG_MAIN: Skipping three-wall corner cuts for {original_filename_base} (not flagged and not auto-detected).", flush=True)
 
     if not three_wall_cuts_successful:
         print(f"DEBUG_MAIN: Three-wall cuts not successful or not run. Proceeding to standard angled cutting for {original_filename_base} (if implemented).", flush=True) # ADDED flush
-        # ... (standard angled cutting logic would go here) ...
-        print(f"DEBUG_MAIN: Standard angled cutting logic placeholder for {original_filename_base}.", flush=True) # ADDED flush
+        
+        angled_cuts_output_dir = os.path.join(base_output_dir_for_file, f"{original_filename_base}_angled_cuts")
+        if not os.path.exists(angled_cuts_output_dir):
+            os.makedirs(angled_cuts_output_dir)
+            print(f"DEBUG_MAIN: Created angled cuts output directory: {angled_cuts_output_dir}", flush=True)
+
+        resulting_angled_pieces = perform_standard_angled_cut(mesh, angled_cuts_output_dir, original_filename_base)
+
+        if resulting_angled_pieces and len(resulting_angled_pieces) == 2:
+            print(f"DEBUG_MAIN: Standard angled cutting successful for {original_filename_base}. Found {len(resulting_angled_pieces)} pieces.", flush=True)
+            # Optionally, set a flag like standard_cuts_successful = True if needed for further logic
+        else:
+            print(f"DEBUG_MAIN: Standard angled cutting did not produce 2 validated pieces for {original_filename_base}.", flush=True)
+        # print(f"DEBUG_MAIN: Standard angled cutting logic placeholder for {original_filename_base}.", flush=True) # ADDED flush - REMOVE/REPLACE THIS
     else:
         print(f"DEBUG_MAIN: Three-wall cuts were successful. Skipping standard angled cutting for {original_filename_base}.", flush=True) # ADDED flush
     
     print(f"DEBUG_MAIN: Processing finished for {args.input_stl}.", flush=True) # ADDED flush
 
 if __name__ == '__main__':
-    print("DEBUG_PS: Script execution started (__name__ == '__main__').", flush=True) # ADDED flush
+    print("DEBUG_PS: Script execution started (__name__ == '__main__').", flush=True)
     main()
-    print("DEBUG_PS: Script execution finished.", flush=True) # ADDED flush
+    print("DEBUG_PS: Script execution finished.", flush=True)
