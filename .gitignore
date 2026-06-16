@@ -1,40 +1,8 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-*.egg
-*.egg-info/
+# Node / web build
+node_modules/
 dist/
 build/
-eggs/
-parts/
-var/
-sdist/
-wheels/
 *.log
-*.pot
-*.mo
-local_settings.py
-db.sqlite3
-instance/
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-
-# Virtual environment
-.venv/
-.venv310/
-venv/
-ENV/
-env/
-env.bak/
-venv.bak/
 
 # IDE / Editor specific
 .vscode/
@@ -43,22 +11,8 @@ venv.bak/
 *.sublime-workspace
 
 # OS specific
-# Windows
 Thumbs.db
 ehthumbs.db
 Desktop.ini
 *.lnk
-
-# Project output files
-*_processed.vox
-*_processed.stl
-scene_processed.stl
-scene_processed.vox
-
-# verify_tiles.py outputs
-*_verify_gaps.vox
-*_verify_overlaps.vox
-*_verify_report.json
-
-# Other
 *.DS_Store
