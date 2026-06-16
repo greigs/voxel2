@@ -935,6 +935,7 @@ def main():
     parser.add_argument("--peg_clearance_mm", type=float, default=tiles_mod.DEFAULT_PEG_CLEARANCE_MM, help=f"Peg-to-hole lateral clearance per side, mm (default: {tiles_mod.DEFAULT_PEG_CLEARANCE_MM}).")
     parser.add_argument("--peg_depth_clearance_mm", type=float, default=tiles_mod.DEFAULT_PEG_DEPTH_CLEARANCE_MM, help=f"How much shorter the peg is than its hole, mm (default: {tiles_mod.DEFAULT_PEG_DEPTH_CLEARANCE_MM}).")
     parser.add_argument("--tile_clearance_mm", type=float, default=tiles_mod.DEFAULT_TILE_CLEARANCE_MM, help=f"Tile inset per side -> hairline seam groove of 2x this between tiles, mm (default: {tiles_mod.DEFAULT_TILE_CLEARANCE_MM}).")
+    parser.add_argument("--bambu_3mf", action="store_true", help="Also write a Bambu/Orca 3MF with tiles laid flat and body/number grouped as two-filament parts.")
 
     args = parser.parse_args()
 
@@ -1028,6 +1029,11 @@ def main():
                     manifest_path=output_manifest_path)
                 if with_labels:
                     save_color_legend(layers, output_legend_json_path, output_legend_png_path)
+                if args.bambu_3mf:
+                    import export_bambu_3mf
+                    output_3mf_path = os.path.join(output_dir, f"{base_name}_bambu.3mf")
+                    print(f"Writing Bambu 3MF to '{output_3mf_path}'...")
+                    export_bambu_3mf.export_tiles_3mf(tile_list, output_3mf_path)
             else:
                 print("No exposed faces; no tiles to save.")
         else:

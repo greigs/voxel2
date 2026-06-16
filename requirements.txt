@@ -7,3 +7,7 @@ trimesh
 embreex
 rtree
 pyvista
+shapely
+manifold3d
+mapbox_earcut
+matplotlib
