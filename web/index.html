@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Voxel Skin Tiler</title>
+    <link rel="stylesheet" href="./src/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <aside id="panel">
+        <h1>Voxel Skin Tiler</h1>
+        <p class="sub">
+          Turn a MagicaVoxel <code>.vox</code> into flat, mitered, multi-color
+          skin tiles - entirely in your browser.
+        </p>
+
+        <section class="card">
+          <label class="file-drop" id="drop">
+            <input type="file" id="file" accept=".vox" hidden />
+            <span id="file-label">Choose or drop a .vox file</span>
+          </label>
+        </section>
+
+        <section class="card">
+          <h2>Parameters</h2>
+          <div class="grid">
+            <label>Scale factor<input type="number" id="scale_factor" value="10" min="1" step="1" /></label>
+            <label>Erosion / T (vox)<input type="number" id="erosion_voxels" value="1" min="1" step="1" /></label>
+            <label>Peg size (vox)<input type="number" id="peg_size_voxels" placeholder="auto ~SF/3" min="1" step="1" /></label>
+            <label>Peg depth (vox)<input type="number" id="peg_depth_voxels" value="3" min="0" step="1" /></label>
+            <label>Voxel size (mm)<input type="number" id="voxel_size_mm" value="1.25" min="0.1" step="0.05" /></label>
+            <label>Emboss depth (mm)<input type="number" id="emboss_depth_mm" value="0.6" min="0.1" step="0.1" /></label>
+            <label>Peg clearance (mm)<input type="number" id="peg_clearance_mm" value="0.1" min="0" step="0.05" /></label>
+            <label>Peg depth clr (mm)<input type="number" id="peg_depth_clearance_mm" value="0.2" min="0" step="0.05" /></label>
+            <label>Tile clearance (mm)<input type="number" id="tile_clearance_mm" value="0.1" min="0" step="0.05" /></label>
+          </div>
+          <label class="check"><input type="checkbox" id="with_labels" checked /> Number + color-code inlays</label>
+          <button id="generate" disabled>Generate tiles</button>
+          <p id="status" class="status"></p>
+        </section>
+
+        <section class="card" id="downloads-card" hidden>
+          <h2>Downloads</h2>
+          <div id="downloads" class="downloads"></div>
+        </section>
+
+        <section class="card" id="view-card" hidden>
+          <h2>View</h2>
+          <label class="slider">Explode
+            <input type="range" id="explode" min="0" max="100" value="0" />
+          </label>
+          <label class="check"><input type="checkbox" id="show_base" checked /> Show base model</label>
+          <label class="check"><input type="checkbox" id="show_numbers" checked /> Show numbers</label>
+          <div id="legend" class="legend"></div>
+        </section>
+
+        <footer>
+          <a href="https://github.com/greigs/voxel2" target="_blank" rel="noopener">source on github</a>
+        </footer>
+      </aside>
+      <main id="viewport"></main>
+    </div>
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>
