@@ -1,91 +1,38 @@
-# Voxel Processor
+# Voxel Skin Tiler
 
-This script, `process_vox.py`, is a command-line tool for processing `.vox` files. It allows scaling of voxel data, erosion of the scaled data, and saving the output in both `.vox` and `.stl` formats.
+Turn a MagicaVoxel `.vox` model into flat, mitered, multi-color **skin tiles** that snap onto a printed base model - one tile per exposed voxel face, each with a registration peg and an optional flush two-color assembly number / paint color-code inlay.
 
-## Features
+The tool (`web/`) runs **entirely client-side** (no server) and is hosted on GitHub Pages. Upload a `.vox`, set parameters, preview in 3D with an explode slider, and download a Bambu/Orca `.3mf`, STLs, a tile manifest, and a color legend.
 
-*   Load MagicaVoxel `.vox` files.
-*   Scale voxel data by a specified factor.
-*   Erode voxel data by a specified number of voxel layers.
-*   Save processed voxel data back to a `.vox` file (with dimension clipping if necessary).
-*   Save processed voxel data as an `.stl` mesh file using the Marching Cubes algorithm for robust geometry.
+The repo includes a few sample `.vox` models (`test.vox`, `pug.vox`, `scene.vox`) you can load to try it out.
 
-## Prerequisites
+## Web tool
 
-*   Python 3.7+ (developed with 3.7)
-*   A virtual environment is recommended.
+Live site: `https://greigs.github.io/voxel2/` (published by the GitHub Actions workflow on push).
 
-## Setup
+It is a static Vite app (vanilla JS + three.js):
 
-1.  **Clone the repository or download the script.**
+1. parse `.vox` -> scale -> erode (tile thickness `T`) -> carve peg holes -> crop (`src/voxParser.js`, `src/voxelOps.js`)
+2. generate one analytic tile per exposed face with 45-degree miters + a central peg (`src/tiles.js`)
 
-2.  **Create and activate a virtual environment (recommended):**
-    ```bash
-    python -m venv .venv
-    # On Windows (pwsh.exe or PowerShell)
-    .\.venv\Scripts\Activate.ps1
-    # On macOS/Linux (bash/zsh)
-    # source .venv/bin/activate
-    ```
+   The peg can carry **crush ribs** - thin triangular ridges on each peg face that locally interfere with the base hole and deform on insertion, so the fit stays snug and consistent across print orientations. Controls (Parameters panel): `Peg ribs (per face)` (default 1, set 0 to disable), `Peg rib height (mm)` (default 0.2), `Peg rib width (mm)` (default 1). Net crush per rib = `rib height - peg clearance` (defaults give 0.1 mm). If snug orientations are too tight, raise peg clearance; if loose ones still slip, raise rib height.
+3. add flush two-color number inlays with no 3D boolean - the flat top is rebuilt as `square - text` plus a shallow text pocket, and the number fills it exactly (`src/labels.js`, using opentype.js + polygon-clipping + earcut)
+4. export a grouped, two-extruder Bambu/Orca `.3mf`, plus STLs / manifest CSV / legend JSON (`src/exporters/`)
+5. preview everything in three.js with an explode slider, base toggle, and color legend (`src/viewer.js`)
 
-3.  **Install dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-    This will install:
-    *   `numpy`
-    *   `scipy`
-    *   `py-vox-io` (for `.vox` file handling)
-    *   `numpy-stl` (for `.stl` file saving, though `skimage` is now primary for mesh generation)
-    *   `scikit-image` (for the Marching Cubes algorithm)
-
-## Usage
-
-The script is run from the command line:
+### Run locally
 
 ```bash
-python process_vox.py <input_vox_file> [options]
+cd web
+npm install
+npm run dev      # open the printed localhost URL
+npm run build    # production build into web/dist
+node test_node.mjs   # geometry sanity check (all tiles closed 2-manifolds)
 ```
 
-**Arguments:**
+### Deploy to GitHub Pages
 
-*   `input_vox_file`: Path to the input `.vox` file (e.g., `scene.vox`). This is a required argument.
-
-**Options:**
-
-*   `--scale_factor <float>`: Factor to scale voxels by. Default: `10.0`.
-*   `--erosion_voxels <int>`: Number of voxel layers to erode after scaling. Default: `1` (as per last script update, previously was 2).
-*   `-h`, `--help`: Show the help message and exit.
-
-**Example:**
-
-```bash
-python process_vox.py scene.vox --scale_factor 10 --erosion_voxels 2
-```
-
-This command will:
-1.  Load `scene.vox`.
-2.  Scale its voxel data by a factor of 10.
-3.  Erode the scaled data by 2 voxel layers.
-4.  Save the result as `scene_processed.vox` in the same directory as `scene.vox`.
-5.  Save the result as `scene_processed.stl` in the same directory as `scene.vox`.
-
-## Output Files
-
-The script will generate two output files in the same directory as the input file:
-
-*   `<input_base_name>_processed.vox`: The processed voxel data in `.vox` format.
-*   `<input_base_name>_processed.stl`: The processed voxel data as an STL mesh.
-
-## Notes
-
-*   **`.vox` File Clipping:** The MagicaVoxel `.vox` format has a maximum size for a single model (typically 256x256x256). If the scaling operation results in dimensions larger than this, the script will clip the data to fit, and a warning will be printed.
-*   **Empty Models:** If the input model is empty or becomes empty after processing, appropriate warnings will be displayed, and empty files (or files representing empty models) will be generated.
-*   **STL Generation:** The STL generation uses the Marching Cubes algorithm, which generally produces better and more manifold meshes from voxel data compared to simply creating a cube for each voxel.
-
-## `.gitignore`
-
-A `.gitignore` file is included to exclude common Python, virtual environment, IDE, OS-specific, and project output files from version control.
+`/.github/workflows/deploy-pages.yml` builds `web/` and publishes `web/dist` on every push that touches `web/`. In the repo, enable **Settings -> Pages -> Build and deployment -> Source: GitHub Actions**. The workflow sets Vite's `base` to `/<repo-name>/` automatically; for local builds you can override with `VITE_BASE`.
 
 ## License
 
