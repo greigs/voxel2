@@ -29,6 +29,7 @@ coverage.xml
 
 # Virtual environment
 .venv/
+.venv310/
 venv/
 ENV/
 env/
@@ -53,6 +54,11 @@ Desktop.ini
 *_processed.stl
 scene_processed.stl
 scene_processed.vox
+
+# verify_tiles.py outputs
+*_verify_gaps.vox
+*_verify_overlaps.vox
+*_verify_report.json
 
 # Other
 *.DS_Store

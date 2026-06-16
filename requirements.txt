@@ -1,5 +1,0 @@
-numpy
-scipy
-py-vox-io
-numpy-stl
-scikit-image
