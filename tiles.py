@@ -47,6 +47,7 @@ DEFAULT_EMBOSS_DEPTH_MM = 0.6  # depth of the flush two-color number inlay
 # peg is shrunk so it actually slides in on an FDM printer.
 DEFAULT_PEG_CLEARANCE_MM = 0.1        # shrink peg per side -> 2x this diametral slop
 DEFAULT_PEG_DEPTH_CLEARANCE_MM = 0.2  # make peg shorter than its hole so it can't bottom out
+DEFAULT_TILE_CLEARANCE_MM = 0.1       # inset each tile per side -> 2x this hairline seam groove
 
 
 # The 6 face directions as (axis, sign).
@@ -163,7 +164,8 @@ def generate_face_tiles(layers, params: TileParams = None,
                         with_labels: bool = False,
                         emboss_depth_mm: float = DEFAULT_EMBOSS_DEPTH_MM,
                         peg_clearance_mm: float = DEFAULT_PEG_CLEARANCE_MM,
-                        peg_depth_clearance_mm: float = DEFAULT_PEG_DEPTH_CLEARANCE_MM) -> List[Tile]:
+                        peg_depth_clearance_mm: float = DEFAULT_PEG_DEPTH_CLEARANCE_MM,
+                        tile_clearance_mm: float = DEFAULT_TILE_CLEARANCE_MM) -> List[Tile]:
     """Generate one tile per exposed face of every surface voxel.
 
     Iterates ``layers.initial_voxels`` (the original, unscaled solid). A face is
@@ -214,6 +216,13 @@ def generate_face_tiles(layers, params: TileParams = None,
     peg_size_fit = max(0.2, peg_size - 2.0 * peg_clearance_mm)
     peg_depth_fit = max(0.2, peg_depth - peg_depth_clearance_mm)
 
+    # Seam clearance: inset each tile by ``tc`` per side (neighbors -> 2*tc groove).
+    tc = max(0.0, tile_clearance_mm)
+    if tc >= (L - 2.0 * T) / 2.0:
+        raise ValueError(f"tile_clearance ({tc}mm) too large for this tile size.")
+    L_fit = L - 2.0 * tc
+    peg_off_face = peg_off_fit - tc  # peg offset relative to the inset corner
+
     dims = vox.shape
     tiles: List[Tile] = []
     next_number = 1
@@ -239,16 +248,19 @@ def generate_face_tiles(layers, params: TileParams = None,
             C[axis] = block_min[axis] + (L if sign > 0 else 0.0)
             # C[ua], C[va] already equal block_min on u/v axes.
 
-            mesh = build_face_tile(C, uhat, vhat, w, L, T, peg_off_fit, peg_off_fit,
-                                   peg_size_fit, peg_depth_fit)
+            # Inset the whole tile by the seam clearance so neighbors leave a hairline
+            # groove. The peg stays aligned to its (unmoved) base hole.
+            C_fit = C + tc * uhat + tc * vhat
+            mesh = build_face_tile(C_fit, uhat, vhat, w, L_fit, T,
+                                   peg_off_face, peg_off_face, peg_size_fit, peg_depth_fit)
             tile = Tile(mesh=mesh, voxel=(int(x), int(y), int(z)),
                         axis=axis, sign=sign, number=next_number, color_code=cc)
             next_number += 1
 
             if label_mod is not None:
-                poly = label_mod.label_polygon([tile.number, tile.color_code], L)
+                poly = label_mod.label_polygon([tile.number, tile.color_code], L_fit)
                 body, number_mesh = label_mod.apply_label(
-                    mesh, poly, C, uhat, vhat, w, L, emboss_depth_mm)
+                    mesh, poly, C_fit, uhat, vhat, w, L_fit, emboss_depth_mm)
                 tile.mesh = body
                 tile.number_mesh = number_mesh
 

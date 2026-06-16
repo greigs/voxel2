@@ -83,6 +83,7 @@ def main():
     parser.add_argument("--peg_depth_voxels", type=int, default=DEFAULT_PEG_DEPTH_VOXELS)
     parser.add_argument("--peg_clearance_mm", type=float, default=tiles_mod.DEFAULT_PEG_CLEARANCE_MM)
     parser.add_argument("--peg_depth_clearance_mm", type=float, default=tiles_mod.DEFAULT_PEG_DEPTH_CLEARANCE_MM)
+    parser.add_argument("--tile_clearance_mm", type=float, default=tiles_mod.DEFAULT_TILE_CLEARANCE_MM)
     parser.add_argument("--subdiv", type=int, default=1,
                         help="Sub-voxel resolution for overlap detection (default: 1).")
     parser.add_argument("--max_explode", type=float, default=2.0,
@@ -131,7 +132,8 @@ def main():
     tile_list = tiles_mod.generate_face_tiles(
         layers, with_labels=with_labels,
         peg_clearance_mm=args.peg_clearance_mm,
-        peg_depth_clearance_mm=args.peg_depth_clearance_mm)
+        peg_depth_clearance_mm=args.peg_depth_clearance_mm,
+        tile_clearance_mm=args.tile_clearance_mm)
     print(f"  {len(tile_list)} tiles.")
     if not tile_list:
         print("No tiles to show.")

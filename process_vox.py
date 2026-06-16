@@ -934,6 +934,7 @@ def main():
     parser.add_argument("--emboss_depth_mm", type=float, default=tiles_mod.DEFAULT_EMBOSS_DEPTH_MM, help=f"Depth of the flush number inlay layer in mm (default: {tiles_mod.DEFAULT_EMBOSS_DEPTH_MM}).")
     parser.add_argument("--peg_clearance_mm", type=float, default=tiles_mod.DEFAULT_PEG_CLEARANCE_MM, help=f"Peg-to-hole lateral clearance per side, mm (default: {tiles_mod.DEFAULT_PEG_CLEARANCE_MM}).")
     parser.add_argument("--peg_depth_clearance_mm", type=float, default=tiles_mod.DEFAULT_PEG_DEPTH_CLEARANCE_MM, help=f"How much shorter the peg is than its hole, mm (default: {tiles_mod.DEFAULT_PEG_DEPTH_CLEARANCE_MM}).")
+    parser.add_argument("--tile_clearance_mm", type=float, default=tiles_mod.DEFAULT_TILE_CLEARANCE_MM, help=f"Tile inset per side -> hairline seam groove of 2x this between tiles, mm (default: {tiles_mod.DEFAULT_TILE_CLEARANCE_MM}).")
 
     args = parser.parse_args()
 
@@ -1015,7 +1016,8 @@ def main():
             tile_list = tiles_mod.generate_face_tiles(
                 layers, with_labels=with_labels, emboss_depth_mm=args.emboss_depth_mm,
                 peg_clearance_mm=args.peg_clearance_mm,
-                peg_depth_clearance_mm=args.peg_depth_clearance_mm)
+                peg_depth_clearance_mm=args.peg_depth_clearance_mm,
+                tile_clearance_mm=args.tile_clearance_mm)
             print(f"  {len(tile_list)} tiles generated.")
             if tile_list:
                 print(f"Saving tiles STL to '{output_gapped_diff_stl_path}'...")
