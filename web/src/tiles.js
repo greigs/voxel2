@@ -157,7 +157,8 @@ export function generateFaceTiles(layers, opts = {}) {
 
       const number = nextNumber++;
       const tile = {
-        voxel: [x, y, z], axis, sign, number, colorCode: cc, numberMesh: null, mesh: null,
+        voxel: [x, y, z], axis, sign, number, colorCode: cc,
+        numberMesh: null, mesh: null, outlineMesh: null,
       };
 
       let poly = null;
@@ -171,6 +172,10 @@ export function generateFaceTiles(layers, opts = {}) {
         const numberMesh = labels.applyLabel(body, poly, Cfit, uhat, vhat, w, Lfit, embossDepthMm);
         tile.mesh = body;
         tile.numberMesh = numberMesh;
+        // A clean tile (no number pocket) for drawing tile-only edge outlines. Cheap
+        // (~14 quads) and never exported - viewer use only.
+        tile.outlineMesh = buildFaceTile(Cfit, uhat, vhat, w, Lfit, T,
+          pegOffFace, pegOffFace, pegSizeFit, pegDepthFit, true);
       } else {
         tile.mesh = buildFaceTile(Cfit, uhat, vhat, w, Lfit, T,
           pegOffFace, pegOffFace, pegSizeFit, pegDepthFit, true);

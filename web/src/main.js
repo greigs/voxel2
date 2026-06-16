@@ -177,6 +177,7 @@ async function generate() {
     state.viewer.setExplode(parseInt($("explode").value, 10) / 100);
     state.viewer.setBaseVisible($("show_base").checked);
     state.viewer.setNumbersVisible($("show_numbers").checked);
+    state.viewer.setEdgesVisible($("show_edges").checked);
     renderLegend(layers);
     $("view-card").hidden = false;
 
@@ -204,6 +205,9 @@ function wireViewControls() {
   });
   $("show_numbers").addEventListener("change", () => {
     if (state.viewer) state.viewer.setNumbersVisible($("show_numbers").checked);
+  });
+  $("show_edges").addEventListener("change", () => {
+    if (state.viewer) state.viewer.setEdgesVisible($("show_edges").checked);
   });
 }
 
