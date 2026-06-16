@@ -43,6 +43,11 @@ class Tile:
 
 DEFAULT_EMBOSS_DEPTH_MM = 0.6  # depth of the flush two-color number inlay
 
+# Print-tolerance defaults (mm). The base peg holes stay at their exact voxel size; the
+# peg is shrunk so it actually slides in on an FDM printer.
+DEFAULT_PEG_CLEARANCE_MM = 0.1        # shrink peg per side -> 2x this diametral slop
+DEFAULT_PEG_DEPTH_CLEARANCE_MM = 0.2  # make peg shorter than its hole so it can't bottom out
+
 
 # The 6 face directions as (axis, sign).
 FACE_DIRECTIONS = [(0, 1), (0, -1), (1, 1), (1, -1), (2, 1), (2, -1)]
@@ -156,12 +161,18 @@ def build_face_tile(C, uhat, vhat, w, L, T, peg_u0, peg_v0, peg_size, peg_depth)
 
 def generate_face_tiles(layers, params: TileParams = None,
                         with_labels: bool = False,
-                        emboss_depth_mm: float = DEFAULT_EMBOSS_DEPTH_MM) -> List[Tile]:
+                        emboss_depth_mm: float = DEFAULT_EMBOSS_DEPTH_MM,
+                        peg_clearance_mm: float = DEFAULT_PEG_CLEARANCE_MM,
+                        peg_depth_clearance_mm: float = DEFAULT_PEG_DEPTH_CLEARANCE_MM) -> List[Tile]:
     """Generate one tile per exposed face of every surface voxel.
 
     Iterates ``layers.initial_voxels`` (the original, unscaled solid). A face is
     exposed when the neighboring original voxel is empty or out of bounds. Output
     ordering is deterministic so all callers reproduce identical tiles.
+
+    ``peg_clearance_mm`` shrinks the peg cross-section per side (the base hole keeps its
+    exact size) and ``peg_depth_clearance_mm`` shortens the peg so it cannot bottom out
+    before the tile seats flush on the base - both for real-world print fit.
 
     When ``with_labels`` is True, each tile gets a unique assembly number and a paint
     color-code written flush on its outer face (a two-color inlay), and ``tile.mesh``
@@ -195,9 +206,13 @@ def generate_face_tiles(layers, params: TileParams = None,
                          "Reduce --peg_size_voxels.")
 
     # Peg offset within the face, aligned to the same integer voxel box the base hole
-    # is carved from, so peg and hole match exactly.
+    # is carved from. The peg is then shrunk (and shortened) by the print clearances so
+    # it fits the exact-size hole on a real printer; it stays centered in the hole.
     start_vox = (SF // 2) - (params.peg_size_voxels // 2)
     peg_off = start_vox * S
+    peg_off_fit = peg_off + peg_clearance_mm
+    peg_size_fit = max(0.2, peg_size - 2.0 * peg_clearance_mm)
+    peg_depth_fit = max(0.2, peg_depth - peg_depth_clearance_mm)
 
     dims = vox.shape
     tiles: List[Tile] = []
@@ -224,8 +239,8 @@ def generate_face_tiles(layers, params: TileParams = None,
             C[axis] = block_min[axis] + (L if sign > 0 else 0.0)
             # C[ua], C[va] already equal block_min on u/v axes.
 
-            mesh = build_face_tile(C, uhat, vhat, w, L, T, peg_off, peg_off,
-                                   peg_size, peg_depth)
+            mesh = build_face_tile(C, uhat, vhat, w, L, T, peg_off_fit, peg_off_fit,
+                                   peg_size_fit, peg_depth_fit)
             tile = Tile(mesh=mesh, voxel=(int(x), int(y), int(z)),
                         axis=axis, sign=sign, number=next_number, color_code=cc)
             next_number += 1
