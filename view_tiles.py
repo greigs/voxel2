@@ -153,7 +153,9 @@ def main():
         all_hi.append(base_mesh.bounds[1])
     lo = np.min(np.array(all_lo), axis=0)
     hi = np.max(np.array(all_hi), axis=0)
-    center = (lo + hi) / 2.0
+    # Tiles explode straight out along their own face normal (so they lift off the base
+    # instead of sliding across it). ``spread`` sets how far one slider unit moves them.
+    spread = float(np.max(hi - lo))
 
     off_screen = args.screenshot is not None
     plotter = pv.Plotter(off_screen=off_screen)
@@ -167,7 +169,8 @@ def main():
     n_overlap = int(sum(flags))
     tile_actors = []  # (actor, direction_vector)
     for i, t in enumerate(tile_list):
-        direction = np.asarray(t.mesh.centroid) - center
+        direction = np.zeros(3)
+        direction[t.axis] = float(t.sign) * spread  # outward along the face normal
         color = (0.90, 0.10, 0.10) if flags[i] else tuple(tiles_mod.tile_color(t))
         actor = plotter.add_mesh(pv.wrap(t.mesh), color=color, name=f"tile_{i}")
         tile_actors.append((actor, direction))
