@@ -7,9 +7,130 @@ from stl import mesh
 import numpy as np # Ensure numpy is imported
 import os # For path operations
 import trimesh # For mesh processing
+from typing import NamedTuple, Optional, Tuple # For the shared ground-truth helper
 from process_stl_parts import process_mesh_object # For advanced mesh processing
 
 CUTOUT_SIZE = 1 # Size of the cube to cut from each surface at the scaled resolution
+DEFAULT_STL_VOXEL_SIZE_MM = 1.25 # Side length of one scaled voxel in the output STL
+DEFAULT_GAP_MM = 0.1 # Gap inserted between per-voxel tiles in the gapped difference STL
+
+
+class ExpectedLayers(NamedTuple):
+    """Ground-truth voxel layers regenerated from a .vox source.
+
+    All boolean arrays except ``base_cropped`` share the scaled-grid shape so the
+    base, skin and full solid can be compared cell-for-cell.
+    """
+    initial_voxels: np.ndarray            # original (unscaled) solid
+    palette: list                          # source palette
+    scaled_solid: np.ndarray               # full scaled solid (base + skin)
+    cutout_voxels: np.ndarray              # voxels removed as surface cutouts
+    base_cropped: np.ndarray               # eroded core, cropped to content (matches _processed.stl)
+    crop_min_coords: Optional[Tuple[int, int, int]]  # min corner of base_cropped within scaled grid
+    base_aligned: np.ndarray               # eroded core placed back into the scaled grid
+    skin: np.ndarray                       # difference = scaled_solid AND NOT base_aligned
+    scale_factor_int: int                  # integer scale factor (SF)
+    voxel_size_mm: float                   # STL voxel size in mm (S)
+    gap_mm: float                          # tile gap in mm
+
+
+def load_vox_to_bool_array(filepath):
+    """Loads the first model of a .vox file into a (bool array, palette) pair."""
+    vox_data_container = VoxParser(filepath).parse()
+
+    if not vox_data_container.models:
+        print(f"Input .vox file '{filepath}' contains no models. Treating as empty (0,0,0).")
+        palette = vox_data_container.palette or [(128, 128, 128, 255)]
+        return np.zeros((0, 0, 0), dtype=bool), palette
+
+    model = vox_data_container.models[0]
+    model_size = model.size
+
+    if not (isinstance(model_size, tuple) and len(model_size) == 3 and
+            all(isinstance(dim, int) and dim >= 0 for dim in model_size)):
+        raise ValueError(f"Invalid model size format for model in '{filepath}': {model_size}. "
+                         "Expected 3 non-negative integers.")
+
+    voxel_data_bool = np.zeros(model_size, dtype=bool)
+    if model.voxels:
+        for x, y, z, _color_index in model.voxels:
+            if 0 <= x < model_size[0] and 0 <= y < model_size[1] and 0 <= z < model_size[2]:
+                voxel_data_bool[x, y, z] = True
+            else:
+                print(f"Warning: Voxel at ({x},{y},{z}) is outside the defined model size {model_size}. Skipping.")
+
+    palette = vox_data_container.palette or [(128, 128, 128, 255)]
+    return voxel_data_bool, palette
+
+
+def compute_expected_layers(vox_path, scale_factor, erosion_voxels,
+                            stl_voxel_size_mm=DEFAULT_STL_VOXEL_SIZE_MM,
+                            gap_mm=DEFAULT_GAP_MM):
+    """Regenerates the expected base/skin/solid voxel layers from a .vox file.
+
+    This runs the exact same scale -> surface-cutout -> erode -> crop -> align ->
+    difference pipeline used to produce the STL outputs, so callers (the generator
+    in ``main`` and the verifier) share identical math.
+    """
+    initial_voxel_data_bool, original_palette = load_vox_to_bool_array(vox_path)
+
+    scaled_voxel_data = scale_voxels(initial_voxel_data_bool, scale_factor)
+    int_sf = int(round(scale_factor))
+
+    data_for_erosion = scaled_voxel_data
+    cutout_voxels = np.zeros_like(scaled_voxel_data, dtype=bool)
+
+    if initial_voxel_data_bool.any() and scaled_voxel_data.any() and int_sf > 0 and CUTOUT_SIZE > 0:
+        data_for_erosion, cutout_voxels = apply_surface_cutouts(
+            initial_voxel_data_bool, scaled_voxel_data, int_sf, CUTOUT_SIZE)
+
+    processed_eroded_uncropped = data_for_erosion
+    crop_min_coords = None
+    if erosion_voxels > 0:
+        processed_eroded_uncropped = erode_voxels(data_for_erosion, erosion_voxels)
+        if np.any(processed_eroded_uncropped):
+            base_cropped, crop_min_coords = crop_voxel_data(processed_eroded_uncropped)
+        else:
+            base_cropped = processed_eroded_uncropped
+    else:
+        base_cropped = data_for_erosion
+
+    # Place the (possibly cropped) eroded core back into the scaled grid.
+    base_aligned = np.zeros_like(scaled_voxel_data, dtype=bool)
+    if np.any(base_cropped):
+        if crop_min_coords is not None:
+            xmin, ymin, zmin = crop_min_coords
+            dxc, dyc, dzc = base_cropped.shape
+            sx = slice(xmin, xmin + dxc)
+            sy = slice(ymin, ymin + dyc)
+            sz = slice(zmin, zmin + dzc)
+            if (sx.start >= 0 and sx.stop <= scaled_voxel_data.shape[0] and
+                    sy.start >= 0 and sy.stop <= scaled_voxel_data.shape[1] and
+                    sz.start >= 0 and sz.stop <= scaled_voxel_data.shape[2]):
+                base_aligned[sx, sy, sz] = base_cropped
+            elif processed_eroded_uncropped.shape == scaled_voxel_data.shape:
+                base_aligned = processed_eroded_uncropped.copy()
+        else:
+            if base_cropped.shape == scaled_voxel_data.shape:
+                base_aligned = base_cropped.copy()
+            elif processed_eroded_uncropped.shape == scaled_voxel_data.shape:
+                base_aligned = processed_eroded_uncropped.copy()
+
+    skin = np.logical_and(scaled_voxel_data, np.logical_not(base_aligned))
+
+    return ExpectedLayers(
+        initial_voxels=initial_voxel_data_bool,
+        palette=original_palette,
+        scaled_solid=scaled_voxel_data,
+        cutout_voxels=cutout_voxels,
+        base_cropped=base_cropped,
+        crop_min_coords=crop_min_coords,
+        base_aligned=base_aligned,
+        skin=skin,
+        scale_factor_int=int_sf,
+        voxel_size_mm=stl_voxel_size_mm,
+        gap_mm=gap_mm,
+    )
 
 def scale_voxels(voxel_data_bool, scale_factor):
     """
@@ -577,51 +698,29 @@ def main():
     output_scaled_stl_path = os.path.join(output_dir, f"{base_name}_scaled.stl") # New path for scaled .stl
     output_gapped_diff_stl_path = os.path.join(output_dir, f"{base_name}_gapped_diff.stl") # New path
 
-    STL_VOXEL_SIZE_MM = 1.25
-    GAP_MM = 0.1 # Gap for the new gapped difference STL
+    STL_VOXEL_SIZE_MM = DEFAULT_STL_VOXEL_SIZE_MM
+    GAP_MM = DEFAULT_GAP_MM # Gap for the new gapped difference STL
 
     try:
         print(f"Loading '{input_path}'...")
-        vox_data_container = VoxParser(input_path).parse()
+        # Regenerate all voxel layers via the shared helper so the generator and
+        # the verifier use identical math.
+        layers = compute_expected_layers(
+            input_path, scale_factor, erosion_amount,
+            stl_voxel_size_mm=STL_VOXEL_SIZE_MM, gap_mm=GAP_MM)
 
-        if not vox_data_container.models:
-            print(f"Input .vox file \'{input_path}\' contains no models. Processing as an empty scene with shape (0,0,0).")
-            # Define a shape that indicates emptiness but is still a 3D array for downstream processing
-            initial_voxel_data_bool = np.zeros((0,0,0), dtype=bool) 
-            original_palette = vox_data_container.palette
-            if not original_palette:
-                original_palette = [(128,128,128,255)] # Default palette
-        else:
-            # Assuming we work with the first model in the file
-            model = vox_data_container.models[0]
-            model_size = model.size # This is (sx, sy, sz)
-            
-            if not (isinstance(model_size, tuple) and len(model_size) == 3 and all(isinstance(dim, int) and dim >= 0 for dim in model_size)):
-                raise ValueError(f"Invalid model size format for model in '{input_path}': {model_size}. Expected 3 non-negative integers.")
+        initial_voxel_data_bool = layers.initial_voxels
+        original_palette = layers.palette
+        scaled_voxel_data = layers.scaled_solid
+        cutout_voxels_to_save = layers.cutout_voxels
+        processed_voxel_data = layers.base_cropped
+        crop_min_coords = layers.crop_min_coords
+        difference_voxels = layers.skin
+        int_sf = layers.scale_factor_int
 
-            initial_voxel_data_bool = np.zeros(model_size, dtype=bool)
-            
-            if model.voxels: # Ensure model.voxels is not None
-                for x, y, z, color_index in model.voxels:
-                    # Voxel coordinates are relative to the model's space.
-                    # Ensure they are within the bounds defined by model_size.
-                    if 0 <= x < model_size[0] and \
-                       0 <= y < model_size[1] and \
-                       0 <= z < model_size[2]:
-                        initial_voxel_data_bool[x, y, z] = True 
-                    else:
-                        print(f"Warning: Voxel at ({x},{y},{z}) is outside the defined model size {model_size}. Skipping.")
-            
-            original_palette = vox_data_container.palette
-            if not original_palette:
-                original_palette = [(128,128,128,255)] # Default palette
-        
         print(f"Original dimensions: {initial_voxel_data_bool.shape}")
         if np.sum(initial_voxel_data_bool) == 0:
             print("Warning: The input .vox model is empty (contains no set voxels).")
-
-        print(f"Scaling by {scale_factor}x...")
-        scaled_voxel_data = scale_voxels(initial_voxel_data_bool, scale_factor)
         print(f"Scaled dimensions: {scaled_voxel_data.shape}")
 
         # Save the scaled data before cutouts or erosion
@@ -633,52 +732,6 @@ def main():
         else:
             print(f"Skipping save of scaled model as it is empty ('{output_scaled_vox_path}', '{output_scaled_stl_path}').")
 
-        # Apply surface cutouts
-        int_sf = int(round(scale_factor))
-        data_for_erosion = scaled_voxel_data 
-        cutout_voxels_to_save = np.zeros_like(scaled_voxel_data, dtype=bool)
-        crop_min_coords = None # Initialize crop_min_coords
-
-        if initial_voxel_data_bool.any() and scaled_voxel_data.any() and int_sf > 0 and CUTOUT_SIZE > 0:
-            num_voxels_before_cutout = np.sum(scaled_voxel_data)
-            print(f"Applying {CUTOUT_SIZE}x{CUTOUT_SIZE}x{CUTOUT_SIZE} surface cutouts from original smallxel surfaces (using effective scale factor {int_sf})...")
-            data_for_erosion, cutout_voxels_to_save = apply_surface_cutouts(
-                initial_voxel_data_bool,
-                scaled_voxel_data,
-                int_sf,
-                CUTOUT_SIZE
-            )
-            num_voxels_after_cutout = np.sum(data_for_erosion)
-            print(f"Dimensions after cutouts: {data_for_erosion.shape}") # Shape should not change
-            if num_voxels_after_cutout == num_voxels_before_cutout:
-                 print("Note: Cutout process did not remove any additional voxels (e.g., no exposed surfaces, cutouts fell outside, or target areas already empty).")
-            else:
-                 print(f"Note: Cutout process removed {num_voxels_before_cutout - num_voxels_after_cutout} voxels.")
-        else:
-            if not (initial_voxel_data_bool.any() and scaled_voxel_data.any()):
-                print("Skipping surface cutouts as initial or scaled model is empty.")
-            elif int_sf <= 0:
-                print(f"Skipping surface cutouts as integer scale factor ({int_sf}) is not positive.")
-            elif CUTOUT_SIZE <= 0:
-                print(f"Skipping surface cutouts as CUTOUT_SIZE ({CUTOUT_SIZE}) is not positive.")
-        
-        processed_voxel_data_eroded_uncropped = data_for_erosion # Store pre-erosion state or post-cutout state
-        if erosion_amount > 0:
-            print(f"Eroding by {erosion_amount} voxel layers...")
-            processed_voxel_data_eroded_uncropped = erode_voxels(data_for_erosion, erosion_amount)
-            print(f"Dimensions after erosion (before crop): {processed_voxel_data_eroded_uncropped.shape}")
-            if np.any(processed_voxel_data_eroded_uncropped):
-                processed_voxel_data, crop_min_coords = crop_voxel_data(processed_voxel_data_eroded_uncropped)
-                print(f"Dimensions after cropping to content: {processed_voxel_data.shape}")
-            else:
-                processed_voxel_data = processed_voxel_data_eroded_uncropped 
-                crop_min_coords = None # No crop occurred as data was empty
-                print(f"Skipping crop as data is empty after erosion.")
-        else:
-            processed_voxel_data = data_for_erosion 
-            crop_min_coords = None # No erosion, so no crop related to erosion path
-            print("Skipping erosion step as erosion_amount is 0 or less.")
-        
         if np.sum(processed_voxel_data) == 0:
             print("Warning: All voxels were removed after scaling and/or erosion.")
 
@@ -688,64 +741,23 @@ def main():
         print(f"Saving processed model as .stl file to '{output_stl_path}'...")
         save_stl_file(output_stl_path, processed_voxel_data, output_voxel_size_mm=STL_VOXEL_SIZE_MM)
 
-        # Calculate and save gapped difference STL
+        # Save gapped difference (skin) STL
+        gapped_stl_saved = False
         if np.any(scaled_voxel_data):
-            print("Calculating boolean difference for gapped STL...")
-            
-            processed_voxels_aligned_for_diff = np.zeros_like(scaled_voxel_data, dtype=bool)
-            source_for_processed_stl_actual = processed_voxel_data # This is what _processed.stl is made from
-
-            if np.any(source_for_processed_stl_actual):
-                if crop_min_coords is not None: # Data was cropped from a larger array
-                    xmin, ymin, zmin = crop_min_coords
-                    dx_crop, dy_crop, dz_crop = source_for_processed_stl_actual.shape
-                    slice_x = slice(xmin, xmin + dx_crop)
-                    slice_y = slice(ymin, ymin + dy_crop)
-                    slice_z = slice(zmin, zmin + dz_crop)
-
-                    if (slice_x.start >= 0 and slice_x.stop <= scaled_voxel_data.shape[0] and
-                        slice_y.start >= 0 and slice_y.stop <= scaled_voxel_data.shape[1] and
-                        slice_z.start >= 0 and slice_z.stop <= scaled_voxel_data.shape[2]):
-                        processed_voxels_aligned_for_diff[slice_x, slice_y, slice_z] = source_for_processed_stl_actual
-                    else:
-                        print(f"Warning: Cropped processed data region {crop_min_coords} with shape {source_for_processed_stl_actual.shape} partly outside scaled data bounds {scaled_voxel_data.shape}. Difference might be inaccurate.")
-                        # Fallback to uncropped eroded data if shapes match, otherwise difference will be vs all False
-                        if processed_voxel_data_eroded_uncropped.shape == scaled_voxel_data.shape:
-                             processed_voxels_aligned_for_diff = processed_voxel_data_eroded_uncropped.copy()
-                             print("Using uncropped eroded data for difference due to bounds issue.")
-                        else:
-                             print("Cannot align processed data due to bounds and shape mismatch of fallback. Difference will be vs empty.")
-
-                else: # No cropping was applied to get source_for_processed_stl_actual
-                    if source_for_processed_stl_actual.shape == scaled_voxel_data.shape:
-                        processed_voxels_aligned_for_diff = source_for_processed_stl_actual.copy()
-                    elif not np.any(source_for_processed_stl_actual) and source_for_processed_stl_actual.size == 0:
-                        pass # Correct, processed_voxels_aligned_for_diff remains all False
-                    else:
-                        print(f"Warning: Shape mismatch for difference. Scaled: {scaled_voxel_data.shape}, Processed (uncropped but different shape): {source_for_processed_stl_actual.shape}. Using uncropped data if possible.")
-                        if processed_voxel_data_eroded_uncropped.shape == scaled_voxel_data.shape:
-                            processed_voxels_aligned_for_diff = processed_voxel_data_eroded_uncropped.copy()
-                        else: # Fallback to assuming processed is empty for difference calc
-                            print("Fallback: Assuming empty processed model for difference due to shape mismatch.")
-            
-            difference_voxels = np.logical_and(scaled_voxel_data, np.logical_not(processed_voxels_aligned_for_diff))
-            
-            gapped_stl_saved = False
             if np.any(difference_voxels):
                 print(f"Saving gapped difference STL to '{output_gapped_diff_stl_path}'...")
                 gapped_stl_saved = save_gapped_difference_stl(
                     output_gapped_diff_stl_path,
-                    initial_voxel_data_bool, 
-                    difference_voxels,       
-                    int_sf,                  
-                    STL_VOXEL_SIZE_MM,       
-                    GAP_MM                   
+                    initial_voxel_data_bool,
+                    difference_voxels,
+                    int_sf,
+                    STL_VOXEL_SIZE_MM,
+                    GAP_MM
                 )
             else:
                 print("No voxels in boolean difference. Skipping gapped difference STL.")
         else:
             print("Scaled voxel data is empty. Skipping gapped difference STL.")
-            gapped_stl_saved = False
 
         print(f"\nProcessing complete for '{input_path}'.")
         print(f"Output .vox: {output_vox_path}")

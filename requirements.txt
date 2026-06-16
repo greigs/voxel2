@@ -3,3 +3,7 @@ scipy
 py-vox-io
 numpy-stl
 scikit-image
+trimesh
+embreex
+rtree
+pyvista
