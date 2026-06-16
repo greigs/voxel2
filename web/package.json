@@ -1,9 +1,9 @@
 {
-  "name": "voxel2-web-tiler",
+  "name": "voxel-paint-by-numbers",
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "Client-side voxel -> multi-color 3D-printable skin tiles. Runs entirely in the browser.",
+  "description": "Voxel Paint-by-Numbers: client-side tool that turns voxel models into numbered, color-coded skin tiles for multicolor 3D prints painted by hand. Runs entirely in the browser.",
   "scripts": {
     "dev": "vite",
     "build": "vite build",

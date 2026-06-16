@@ -1,6 +1,6 @@
-# Voxel Skin Tiler
+# Voxel Paint-by-Numbers
 
-Turn a MagicaVoxel `.vox` model into flat, mitered, multi-color **skin tiles** that snap onto a printed base model - one tile per exposed voxel face, each with a registration peg and an optional flush two-color assembly number / paint color-code inlay.
+Make multicolor 3D prints of voxel models in **hundreds of colors** using ordinary paints (e.g. spray paint): turn a MagicaVoxel `.vox` model into flat, mitered **skin tiles** that snap onto a printed base model - one tile per exposed voxel face, each with a registration peg and an optional flush two-color assembly number / paint color-code inlay.
 
 The tool (`web/`) runs **entirely client-side** (no server) and is hosted on GitHub Pages. Upload a `.vox`, set parameters, preview in 3D with an explode slider, and download a Bambu/Orca `.3mf`, STLs, a tile manifest, and a color legend.
 
@@ -8,7 +8,7 @@ The repo includes a few sample `.vox` models (`test.vox`, `pug.vox`, `scene.vox`
 
 ## Web tool
 
-Live site: `https://greigs.github.io/voxel2/` (published by the GitHub Actions workflow on push).
+Live site: `https://greigs.github.io/voxel-paint-by-numbers/` (published by the GitHub Actions workflow on push).
 
 It is a static Vite app (vanilla JS + three.js):
 

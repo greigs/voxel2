@@ -61,7 +61,7 @@ export async function exportTiles3mf(tiles, opts = {}) {
     '<model unit="millimeter" xml:lang="en-US" ' +
       'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" ' +
       'xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06">\n',
-    ' <metadata name="Application">voxel2-web-tiler</metadata>\n',
+    ' <metadata name="Application">voxel-paint-by-numbers</metadata>\n',
     ' <resources>\n',
   ];
   const build = [' <build>\n'];
