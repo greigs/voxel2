@@ -41,6 +41,9 @@ function readParams() {
     pegClearanceMm: num("peg_clearance_mm"),
     pegDepthClearanceMm: num("peg_depth_clearance_mm"),
     tileClearanceMm: num("tile_clearance_mm"),
+    pegRibCount: parseInt($("peg_rib_count").value, 10),
+    pegRibHeightMm: num("peg_rib_height_mm"),
+    pegRibWidthMm: num("peg_rib_width_mm"),
     withLabels: $("with_labels").checked,
   };
 }
@@ -143,6 +146,9 @@ async function generate() {
       pegClearanceMm: p.pegClearanceMm,
       pegDepthClearanceMm: p.pegDepthClearanceMm,
       tileClearanceMm: p.tileClearanceMm,
+      pegRibCount: p.pegRibCount,
+      pegRibHeightMm: p.pegRibHeightMm,
+      pegRibWidthMm: p.pegRibWidthMm,
     });
     if (!tiles.length) throw new Error("No exposed faces; nothing to generate.");
 
