@@ -70,10 +70,13 @@ function pegOutlineRing(pegU0, pegV0, pegSize, count, height, width) {
 // Build one tile body mesh. Parameters in millimeters; see tiles.build_face_tile.
 // When includeOuterFace is false, the flat top quad is omitted so labels.js can add a
 // number pocket in its place. When `ribs` ({count, height, width}) is set, the peg gets
-// triangular crush ribs; otherwise it is a plain square peg.
+// triangular crush ribs; otherwise it is a plain square peg. When `backLabel`
+// ({poly, depth}) is set, the inner (back) face is engraved with the position number and
+// an up-arrow instead of the plain inner ring.
 export function buildFaceTile(C, uhat, vhat, w, L, T, pegU0, pegV0, pegSize, pegDepth,
-                             includeOuterFace = true, ribs = null) {
+                             includeOuterFace = true, ribs = null, backLabel = null) {
   const n = scale(w, -1); // outward normal
+  const half = L / 2.0;
 
   const P00 = C;
   const P10 = add(C, scale(uhat, L));
@@ -101,9 +104,15 @@ export function buildFaceTile(C, uhat, vhat, w, L, T, pegU0, pegV0, pegSize, peg
     const toWorld = (u, v, d) =>
       add(add(add(C, scale(uhat, u)), scale(vhat, v)), scale(w, d));
     const pegOutline = pegOutlineRing(pegU0, pegV0, pegSize, ribs.count, ribs.height, ribs.width);
-    const innerSquare = [[T, T], [L - T, T], [L - T, L - T], [T, L - T]];
-    // Top frame = inner square with the peg outline as a hole (peg outline reversed -> CW).
-    addCap(m, [innerSquare, pegOutline.slice().reverse()], toWorld, T, w);
+    if (backLabel) {
+      // Inner face is built (with the peg outline as a hole) by the engraver.
+      const pegHoleC = pegOutline.map(([u, v]) => [u - half, v - half]);
+      m.backMark = labels.applyBackLabel(m, backLabel.poly, C, uhat, vhat, w, L, T, backLabel.depth, [pegHoleC]);
+    } else {
+      const innerSquare = [[T, T], [L - T, T], [L - T, L - T], [T, L - T]];
+      // Top frame = inner square with the peg outline as a hole (peg outline reversed -> CW).
+      addCap(m, [innerSquare, pegOutline.slice().reverse()], toWorld, T, w);
+    }
     // Peg side walls and bottom cap.
     addWalls(m, [pegOutline], toWorld, T, T + pegDepth, uhat, vhat);
     addCap(m, [pegOutline], toWorld, T + pegDepth, w);
@@ -124,10 +133,16 @@ export function buildFaceTile(C, uhat, vhat, w, L, T, pegU0, pegV0, pegSize, peg
   const S01 = add(R01, scale(w, pegDepth));
 
   // Inner face ring (frame between inner square and peg footprint).
-  m.addQuad(Q00, Q10, R10, R00, w);
-  m.addQuad(Q10, Q11, R11, R10, w);
-  m.addQuad(Q11, Q01, R01, R11, w);
-  m.addQuad(Q01, Q00, R00, R01, w);
+  if (backLabel) {
+    const pegHoleC = [[pegU0, pegV0], [pu1, pegV0], [pu1, pv1], [pegU0, pv1]]
+      .map(([u, v]) => [u - half, v - half]);
+    m.backMark = labels.applyBackLabel(m, backLabel.poly, C, uhat, vhat, w, L, T, backLabel.depth, [pegHoleC]);
+  } else {
+    m.addQuad(Q00, Q10, R10, R00, w);
+    m.addQuad(Q10, Q11, R11, R10, w);
+    m.addQuad(Q11, Q01, R01, R11, w);
+    m.addQuad(Q01, Q00, R00, R01, w);
+  }
   // Peg walls.
   m.addQuad(R00, R10, S10, S00, nv);
   m.addQuad(R10, R11, S11, S10, uhat);
@@ -155,6 +170,7 @@ export function generateFaceTiles(layers, opts = {}) {
     pegRibCount = DEFAULT_PEG_RIB_COUNT,
     pegRibHeightMm = DEFAULT_PEG_RIB_HEIGHT_MM,
     pegRibWidthMm = DEFAULT_PEG_RIB_WIDTH_MM,
+    withBackLabel = false,
   } = opts;
 
   const vox = layers.initialVoxels;
@@ -205,6 +221,25 @@ export function generateFaceTiles(layers, opts = {}) {
     }
   }
 
+  // Engraved back marking (position number + up-arrow). Needs the font, room in the bands
+  // flanking the peg, and a recess shallower than the tile thickness. The peg footprint
+  // used for layout includes the crush ribs so the text/arrow stay clear of the rib tabs.
+  // The peg is not always centered (scale/peg-size parity), so use its actual center and
+  // gate on the smaller of the two bands.
+  const backInnerSize = Lfit - 2.0 * T;
+  const pegSizeForLayout = pegSizeFit + 2.0 * (ribs ? ribs.height : 0.0);
+  const pegCenterC = pegOffFace + pegSizeFit / 2.0 - Lfit / 2.0;
+  const hiC = backInnerSize / 2.0;
+  const botBand = (pegCenterC - pegSizeForLayout / 2.0) - (-hiC);
+  const topBand = hiC - (pegCenterC + pegSizeForLayout / 2.0);
+  const backDepth = Math.min(embossDepthMm, T * 0.6);
+  const wantBack = withBackLabel && labels.isReady() &&
+    Math.min(botBand, topBand) >= 1.3 && backDepth > 0.05;
+  const makeBack = (num) => {
+    const p = labels.backLabelPolygon(num, backInnerSize, pegSizeForLayout, pegCenterC);
+    return p ? { poly: p, depth: backDepth } : null;
+  };
+
   const dims = vox.shape;
   const tiles = [];
   let nextNumber = 1;
@@ -234,31 +269,34 @@ export function generateFaceTiles(layers, opts = {}) {
       const number = nextNumber++;
       const tile = {
         voxel: [x, y, z], axis, sign, number, colorCode: cc,
-        numberMesh: null, mesh: null, outlineMesh: null,
+        numberMesh: null, mesh: null, outlineMesh: null, backMesh: null,
       };
 
       let poly = null;
       if (withLabels) {
         poly = labels.labelPolygon([number, cc], Lfit);
       }
+      const backLabel = wantBack ? makeBack(number) : null;
 
       if (poly) {
         const body = buildFaceTile(Cfit, uhat, vhat, w, Lfit, T,
-          pegOffFace, pegOffFace, pegSizeFit, pegDepthFit, false, ribs);
+          pegOffFace, pegOffFace, pegSizeFit, pegDepthFit, false, ribs, backLabel);
         const numberMesh = labels.applyLabel(body, poly, Cfit, uhat, vhat, w, Lfit, embossDepthMm);
         tile.mesh = body;
         tile.numberMesh = numberMesh;
-        // A clean tile (no number pocket, no ribs) for drawing tile-only edge outlines.
-        // Cheap and never exported - viewer use only.
+        tile.backMesh = body.backMark || null;
+        // A clean tile (no number pocket, no ribs, no back engraving) for drawing tile-only
+        // edge outlines. Cheap and never exported - viewer use only.
         tile.outlineMesh = buildFaceTile(Cfit, uhat, vhat, w, Lfit, T,
-          pegOffFace, pegOffFace, pegSizeFit, pegDepthFit, true, null);
+          pegOffFace, pegOffFace, pegSizeFit, pegDepthFit, true, null, null);
       } else {
         tile.mesh = buildFaceTile(Cfit, uhat, vhat, w, Lfit, T,
-          pegOffFace, pegOffFace, pegSizeFit, pegDepthFit, true, ribs);
-        // Clean outline (no ribs) for the viewer when ribs are enabled.
-        if (ribs) {
+          pegOffFace, pegOffFace, pegSizeFit, pegDepthFit, true, ribs, backLabel);
+        tile.backMesh = tile.mesh.backMark || null;
+        // Clean outline (no ribs, no back engraving) for the viewer when needed.
+        if (ribs || backLabel) {
           tile.outlineMesh = buildFaceTile(Cfit, uhat, vhat, w, Lfit, T,
-            pegOffFace, pegOffFace, pegSizeFit, pegDepthFit, true, null);
+            pegOffFace, pegOffFace, pegSizeFit, pegDepthFit, true, null, null);
         }
       }
 

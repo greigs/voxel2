@@ -17,6 +17,8 @@ It is a static Vite app (vanilla JS + three.js):
 
    The peg can carry **crush ribs** - thin triangular ridges on each peg face that locally interfere with the base hole and deform on insertion, so the fit stays snug and consistent across print orientations. Controls (Parameters panel): `Peg ribs (per face)` (default 1, set 0 to disable), `Peg rib height (mm)` (default 0.2), `Peg rib width (mm)` (default 1). Net crush per rib = `rib height - peg clearance` (defaults give 0.1 mm). If snug orientations are too tight, raise peg clearance; if loose ones still slip, raise rib height.
 3. add flush two-color number inlays with no 3D boolean - the flat top is rebuilt as `square - text` plus a shallow text pocket, and the number fills it exactly (`src/labels.js`, using opentype.js + polygon-clipping + earcut)
+
+   Optionally (`Back number + up-arrow (2nd color)`, default on) the position number and an up-arrow are added to the back (inner) face as a flush two-color inlay (same technique as the front), so orientation and placement stay readable after the painted front number is covered. The inlay is flush (not raised) because the back seats against the base, and it prints cleanly since tiles print with the peg/back facing up. It exports on the same (number) extruder as the front inlay.
 4. export a grouped, two-extruder Bambu/Orca `.3mf`, plus STLs / manifest CSV / legend JSON (`src/exporters/`)
 5. preview everything in three.js with an explode slider, base toggle, and color legend (`src/viewer.js`)
 

@@ -45,6 +45,7 @@ function readParams() {
     pegRibHeightMm: num("peg_rib_height_mm"),
     pegRibWidthMm: num("peg_rib_width_mm"),
     withLabels: $("with_labels").checked,
+    withBackLabel: $("with_back_label").checked,
   };
 }
 
@@ -133,7 +134,7 @@ async function generate() {
     await nextFrame();
     const layers = computeLayers(parsed, p);
 
-    if (p.withLabels) {
+    if (p.withLabels || p.withBackLabel) {
       setStatus("Loading font...");
       await labels.loadFont(FONT_URL);
     }
@@ -149,6 +150,7 @@ async function generate() {
       pegRibCount: p.pegRibCount,
       pegRibHeightMm: p.pegRibHeightMm,
       pegRibWidthMm: p.pegRibWidthMm,
+      withBackLabel: p.withBackLabel,
     });
     if (!tiles.length) throw new Error("No exposed faces; nothing to generate.");
 

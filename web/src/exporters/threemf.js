@@ -78,7 +78,15 @@ export async function exportTiles3mf(tiles, opts = {}) {
     n[t.axis] = t.sign;
     const R = alignVectors(n, targetDown);
     const body = t.mesh.clone().applyRotation(R);
-    const number = t.numberMesh ? t.numberMesh.clone().applyRotation(R) : null;
+    // Second-extruder part = front number inlay + back number/arrow inlay (same color),
+    // merged into one part before rotation.
+    let number = null;
+    if (t.numberMesh) number = t.numberMesh.clone();
+    if (t.backMesh) {
+      if (number) number.append(t.backMesh);
+      else number = t.backMesh.clone();
+    }
+    if (number) number.applyRotation(R);
 
     const meshes = [body];
     if (number) meshes.push(number);
