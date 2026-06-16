@@ -98,6 +98,10 @@ export class Viewer {
     // shows its exact paint color). Scene lights have no effect on these.
     const numberMat = new THREE.MeshBasicMaterial({ color: numberColorHex });
 
+    // Back-mark (engraved number/arrow) material - contrasting, double-sided so it reads
+    // from the back regardless of winding.
+    const backMarkMat = new THREE.MeshBasicMaterial({ color: numberColorHex, side: THREE.DoubleSide });
+
     // Real paint color per tile, from the voxel palette via the color-code legend. One
     // shared material per color keeps large models light.
     const legend = (layers && layers.colorLegend) || new Map();
@@ -145,6 +149,21 @@ export class Viewer {
         outline.position.copy(normal).multiplyScalar(0.05);
         group.add(outline);
         this.numberMeshes.push(outline);
+      }
+      if (t.backMesh) {
+        // Flush back number/arrow inlay: render in the contrasting number color, with a
+        // white border (offset slightly toward the back) for legibility on dark tiles.
+        const backGeom = geomFromMesh(t.backMesh);
+        const bm = new THREE.Mesh(backGeom, backMarkMat);
+        group.add(bm);
+        this.numberMeshes.push(bm);
+        const beg = new THREE.EdgesGeometry(backGeom, 20);
+        const blsg = new LineSegmentsGeometry().fromEdgesGeometry(beg);
+        beg.dispose();
+        const boutline = new LineSegments2(blsg, this.numberOutlineMat);
+        boutline.position.copy(normal).multiplyScalar(-0.05);
+        group.add(boutline);
+        this.numberMeshes.push(boutline);
       }
       this.tilesRoot.add(group);
       this.tileGroups.push({ group, normal });

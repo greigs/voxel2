@@ -165,6 +165,78 @@ export function labelPolygon(lines, faceSize, marginFrac = 0.16) {
   return rotateMP(u, 0.013);
 }
 
+// Up-arrow outline (centered at origin, ~[-0.5,0.5], y up) as a polygon-clipping
+// MultiPolygon. Used for the back-face orientation mark.
+export function arrowPolygon() {
+  const ring = [
+    [0.0, 0.5],   // apex
+    [0.5, 0.0],   // right wing
+    [0.2, 0.0],
+    [0.2, -0.5],  // shaft
+    [-0.2, -0.5],
+    [-0.2, 0.0],
+    [-0.5, 0.0],  // left wing
+  ];
+  return polygonClipping.union([[closeRing(ring)]]);
+}
+
+/**
+ * Lay out the engraved back marking: the position number in the band below the peg and an
+ * up-arrow in the band above it, sized to the (possibly asymmetric) flat bands flanking
+ * the central peg. Coordinates are face-centered millimeters (origin at the face center),
+ * matching applyBackLabel.
+ *
+ * @param number      position number (integer/string)
+ * @param innerSize   inner-face square side (L - 2T), mm
+ * @param pegSize     peg footprint side (fit, including ribs), mm
+ * @param pegCenterV  peg center offset along v in face-centered coords, mm (peg is not
+ *                    always centered when the scale/peg-size parity differ)
+ */
+export function backLabelPolygon(number, innerSize, pegSize, pegCenterV = 0.0, marginFrac = 0.12) {
+  if (!FONT) return null;
+  const hi = innerSize / 2.0;
+  const pegHalf = pegSize / 2.0;
+  const pegBottom = pegCenterV - pegHalf;
+  const pegTop = pegCenterV + pegHalf;
+  const botBandH = pegBottom - (-hi); // band below the peg
+  const topBandH = hi - pegTop;       // band above the peg
+  if (botBandH <= 0.6 && topBandH <= 0.6) return null;
+
+  const parts = [];
+
+  // Position number, centered in the band below the peg.
+  if (botBandH > 0.6) {
+    const g = glyphFill(String(number));
+    if (g && g.length) {
+      const targetH = botBandH * (1.0 - 2.0 * marginFrac);
+      const targetW = innerSize * (1.0 - 2.0 * marginFrac);
+      const cy = (-hi + pegBottom) / 2.0;
+      parts.push(fitMP(g, targetW, targetH, 0.0, cy));
+    }
+  }
+  // Up-arrow, centered in the band above the peg.
+  if (topBandH > 0.6) {
+    const a = arrowPolygon();
+    if (a && a.length) {
+      const targetH = topBandH * (1.0 - 2.0 * marginFrac);
+      const cy = (pegTop + hi) / 2.0;
+      parts.push(fitMP(a, targetH, targetH, 0.0, cy));
+    }
+  }
+  if (!parts.length) return null;
+
+  let u = parts[0];
+  for (let i = 1; i < parts.length; i++) u = polygonClipping.union(u, parts[i]);
+
+  // Simplify + general position, as in labelPolygon (tolerance scaled to the band so the
+  // small digits stay legible).
+  const tol = Math.max(1e-4, Math.max(botBandH, topBandH) * 0.02);
+  u = u.map((poly) => poly.map((ring) => simplifyRing(ring, tol)).filter((r) => r.length >= 3));
+  u = u.filter((poly) => poly.length && poly[0].length >= 3);
+  if (!u.length) return null;
+  return rotateMP(u, 0.013);
+}
+
 // Ramer-Douglas-Peucker on an open polyline (endpoints kept).
 function rdp(pts, tol) {
   if (pts.length < 3) return pts.slice();
@@ -394,6 +466,110 @@ export function applyLabel(body, textfill, C, uhat, vhat, w, L, emboss) {
   } catch (e) {
     // Never let a bad glyph abort a whole run.
     if (body.triCount === 0) closeOuterFace();
+    return null;
+  }
+}
+
+/**
+ * Engrave the back (inner) face: build the inner-face annulus (inner square Q minus the
+ * peg footprint minus the text outlines) at depth T, plus a shallow recess (pocket floor
+ * + walls) for the number/arrow toward the outer face. Single color, no inlay returned.
+ * On failure, rebuilds the plain annulus so the body stays closed.
+ *
+ * @param body         tile body mesh (this adds the inner-face geometry to it)
+ * @param backfill     polygon-clipping MultiPolygon in face-centered coords (or null)
+ * @param C            min-(u,v) outer-face corner (world)
+ * @param uhat,vhat,w  tile face frame (w inward, so the back face normal is w)
+ * @param L            face size (mm)
+ * @param T            tile thickness (mm) - the inner face sits at depth T
+ * @param depth        pocket depth (mm), must be < T
+ * @param pegHoleRings array of peg footprint rings in face-centered coords
+ * @returns a watertight inlay Mesh that fills the pocket flush with the back face (for the
+ *          second extruder / preview), or null
+ */
+export function applyBackLabel(body, backfill, C, uhat, vhat, w, L, T, depth, pegHoleRings) {
+  const half = L / 2.0;
+  const innerHalf = half - T;
+  const hi = innerHalf;
+  const toWorld = (u, v, d) =>
+    add(add(add(C, scale(uhat, u + half)), scale(vhat, v + half)), scale(w, d));
+
+  const addTris = (mesh, tris, d, ref) => {
+    for (const t of tris) {
+      mesh.addTriRef(
+        toWorld(t[0][0], t[0][1], d),
+        toWorld(t[1][0], t[1][1], d),
+        toWorld(t[2][0], t[2][1], d),
+        ref,
+      );
+    }
+  };
+  const addCapB = (mesh, polysN, d, ref) => {
+    for (const rings of polysN) addTris(mesh, triangulatePolygon(rings), d, ref);
+  };
+  const addWallsB = (mesh, polysN, d0, d1, refSign) => {
+    for (const rings of polysN) for (const ring of rings) {
+      const len = ring.length;
+      for (let i = 0; i < len; i++) {
+        const p0 = ring[i];
+        const p1 = ring[(i + 1) % len];
+        const ext2d = [p1[1] - p0[1], -(p1[0] - p0[0])];
+        let ref = add(scale(uhat, ext2d[0]), scale(vhat, ext2d[1]));
+        if (refSign < 0) ref = scale(ref, -1);
+        mesh.addQuad(
+          toWorld(p0[0], p0[1], d0), toWorld(p1[0], p1[1], d0),
+          toWorld(p1[0], p1[1], d1), toWorld(p0[0], p0[1], d1), ref,
+        );
+      }
+    }
+  };
+  const pegHolesCW = pegHoleRings.map((r) => {
+    const area = signedArea([...r, r[0]]);
+    return area > 0 ? reverseRing(r) : r.slice();
+  });
+  const Q = [[-hi, -hi], [hi, -hi], [hi, hi], [-hi, hi]]; // CCW
+  // Fallback: Q minus peg, single earcut (one hole -> robust).
+  const closeInnerRing = () => addTris(body, triangulatePolygon([Q, ...pegHolesCW]), T, w);
+
+  try {
+    if (!backfill || !backfill.length) { closeInnerRing(); return null; }
+
+    // Back face is viewed from the +w side; mirror text in u when the basis is left-handed
+    // relative to w so the digits/arrow read correctly (mirror vs the front, as needed when
+    // the tile is flipped to install). The arrow stays pointing +v (mirror is in u only).
+    let fill = backfill;
+    if (dot(cross(uhat, vhat), w) < 0) {
+      fill = fill.map((poly) => poly.map((ring) => ring.map(([x, y]) => [-x, y])));
+    }
+    const fillN = fill.map(normalizePolygon).filter((p) => p.length && p[0].length >= 3);
+    if (!fillN.length) { closeInnerRing(); return null; }
+
+    // Back lid = Q (perimeter kept intact so it matches the bevel walls) with the peg and
+    // each text outer ring as holes; glyph counters added back as solid islands. Same
+    // single-earcut structure the front lid uses (which is reliable), plus the peg hole.
+    const lidRings = [Q, ...pegHolesCW, ...fillN.map((poly) => reverseRing(poly[0]))];
+    addTris(body, triangulatePolygon(lidRings), T, w);
+    for (const poly of fillN) {
+      for (let h = 1; h < poly.length; h++) {
+        addTris(body, triangulatePolygon([reverseRing(poly[h])]), T, w); // counter CCW
+      }
+    }
+
+    // Body pocket: floor toward the outer face + walls facing into the cavity.
+    const floorD = T - depth;
+    addCapB(body, fillN, floorD, w);
+    addWallsB(body, fillN, T, floorD, -1);
+
+    // Flush two-color inlay solid that fills the pocket exactly (top flush with the back
+    // face, bottom at the floor, outward side walls) - same construction as the front
+    // number. Exported on the number extruder and shown in the viewer.
+    const inlay = new Mesh();
+    addCapB(inlay, fillN, T, w);                 // flush top (back surface), faces +w
+    addCapB(inlay, fillN, floorD, scale(w, -1)); // bottom faces -w
+    addWallsB(inlay, fillN, T, floorD, 1);       // outward side walls
+    return inlay.triCount > 0 ? inlay : null;
+  } catch (e) {
+    closeInnerRing();
     return null;
   }
 }

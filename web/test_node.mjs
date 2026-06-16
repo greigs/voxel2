@@ -115,5 +115,30 @@ assert(numbered > 0, `at least some tiles got number inlays (${numbered}/${tiles
 assert(labeledBodyBad === 0, `all labeled bodies are closed manifolds (bad=${labeledBodyBad})`);
 assert(numberBad === 0, `all number inlays are closed manifolds (bad=${numberBad})`);
 
+// --- engraved back marking: bodies must stay closed manifolds (with and without front) ---
+for (const withLabels of [false, true]) {
+  const tilesBack = generateFaceTiles(layers, { withLabels, withBackLabel: true });
+  let backBad = 0, inlayBad = 0, marked = 0;
+  for (const t of tilesBack) {
+    const r = manifoldReport(t.mesh);
+    if (r.bad !== 0 || r.euler !== 2) {
+      backBad++;
+      if (backBad <= 3) {
+        console.error(`  bad back body num=${t.number} withLabels=${withLabels} axis=${t.axis} sign=${t.sign}`, { V: r.V, F: r.F, E: r.E, euler: r.euler, bad: r.bad });
+        for (const be of r.badEdges) console.error("    edge cnt", be.cnt, "a", be.a.map((x) => +x.toFixed(3)), "b", be.b.map((x) => +x.toFixed(3)));
+      }
+    }
+    if (t.backMesh && t.backMesh.triCount > 0) {
+      marked++;
+      const ri = manifoldReport(t.backMesh);
+      if (ri.bad !== 0) { inlayBad++; if (inlayBad <= 3) console.error("  bad back inlay", t.number, ri); }
+    }
+  }
+  // Every tile should actually get an inlay (not silently fall back to a plain ring).
+  assert(marked === tilesBack.length, `all tiles got a back inlay (withLabels=${withLabels}, ${marked}/${tilesBack.length})`);
+  assert(backBad === 0, `all back bodies are closed manifolds (withLabels=${withLabels}, bad=${backBad})`);
+  assert(inlayBad === 0, `all back inlays are closed manifolds (withLabels=${withLabels}, bad=${inlayBad})`);
+}
+
 console.log(failures === 0 ? "\nALL CHECKS PASSED" : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);
