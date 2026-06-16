@@ -1,0 +1,34 @@
+{
+  "colors": [
+    {
+      "color_code": 1,
+      "palette_index": 1,
+      "rgb": [
+        220,
+        60,
+        60
+      ],
+      "hex": "#DC3C3C"
+    },
+    {
+      "color_code": 2,
+      "palette_index": 2,
+      "rgb": [
+        70,
+        180,
+        70
+      ],
+      "hex": "#46B446"
+    },
+    {
+      "color_code": 3,
+      "palette_index": 3,
+      "rgb": [
+        70,
+        110,
+        220
+      ],
+      "hex": "#466EDC"
+    }
+  ]
+}
