@@ -9,10 +9,20 @@ import os # For path operations
 import trimesh # For mesh processing
 from typing import NamedTuple, Optional, Tuple # For the shared ground-truth helper
 from process_stl_parts import process_mesh_object # For advanced mesh processing
+import tiles as tiles_mod # Flat mitered per-face tile generator
 
-CUTOUT_SIZE = 1 # Size of the cube to cut from each surface at the scaled resolution
+CUTOUT_SIZE = 1 # Legacy: size of the cube cut from each surface (kept for reference)
 DEFAULT_STL_VOXEL_SIZE_MM = 1.25 # Side length of one scaled voxel in the output STL
 DEFAULT_GAP_MM = 0.1 # Gap inserted between per-voxel tiles in the gapped difference STL
+DEFAULT_PEG_DEPTH_VOXELS = 3 # How far the registration peg sinks into the base (scaled voxels)
+
+# Face directions as (axis, sign), shared with tiles.py.
+FACE_DIRECTIONS = [(0, 1), (0, -1), (1, 1), (1, -1), (2, 1), (2, -1)]
+
+
+def default_peg_size_voxels(scale_factor_int):
+    """Default registration peg cross-section: roughly one third of the voxel face."""
+    return max(1, int(round(scale_factor_int / 3.0)))
 
 
 class ExpectedLayers(NamedTuple):
@@ -23,15 +33,76 @@ class ExpectedLayers(NamedTuple):
     """
     initial_voxels: np.ndarray            # original (unscaled) solid
     palette: list                          # source palette
-    scaled_solid: np.ndarray               # full scaled solid (base + skin)
-    cutout_voxels: np.ndarray              # voxels removed as surface cutouts
-    base_cropped: np.ndarray               # eroded core, cropped to content (matches _processed.stl)
+    scaled_solid: np.ndarray               # full scaled solid
+    cutout_voxels: np.ndarray              # voxels removed as peg holes from the base
+    base_cropped: np.ndarray               # eroded core with peg holes, cropped (matches _processed.stl)
     crop_min_coords: Optional[Tuple[int, int, int]]  # min corner of base_cropped within scaled grid
-    base_aligned: np.ndarray               # eroded core placed back into the scaled grid
-    skin: np.ndarray                       # difference = scaled_solid AND NOT base_aligned
+    base_aligned: np.ndarray               # eroded core (with holes) placed back into the scaled grid
+    skin: np.ndarray                       # difference = scaled_solid AND NOT base_aligned (debug only)
     scale_factor_int: int                  # integer scale factor (SF)
     voxel_size_mm: float                   # STL voxel size in mm (S)
     gap_mm: float                          # tile gap in mm
+    tile_thickness_voxels: int             # T: bevel depth / skin thickness (scaled voxels)
+    peg_size_voxels: int                   # p: peg cross-section (scaled voxels)
+    peg_depth_voxels: int                  # d: peg depth (scaled voxels)
+
+
+def carve_peg_holes(base_uncropped, initial_voxels, scale_factor_int,
+                    tile_thickness_voxels, peg_size_voxels, peg_depth_voxels):
+    """Carve a square peg hole into the base under each exposed voxel face.
+
+    Operates in the scaled grid (uncropped). For each exposed face, removes a
+    ``peg_size`` x ``peg_size`` x ``peg_depth`` box centered on the face, starting at
+    the base surface (``tile_thickness`` voxels below the model surface) and going
+    deeper. Returns ``(carved_base, holes_mask)``.
+    """
+    SF = scale_factor_int
+    base = base_uncropped.copy()
+    holes = np.zeros_like(base, dtype=bool)
+    if SF <= 0 or not np.any(initial_voxels) or base.shape != tuple(np.array(initial_voxels.shape) * SF):
+        return base, holes
+
+    dims = initial_voxels.shape
+    shape = base.shape
+    start = (SF // 2) - (peg_size_voxels // 2)
+    T = tile_thickness_voxels
+    d = peg_depth_voxels
+
+    for (x, y, z) in np.argwhere(initial_voxels):
+        block_min = np.array([x, y, z]) * SF
+        for axis, sign in FACE_DIRECTIONS:
+            nb = [int(x), int(y), int(z)]
+            nb[axis] += sign
+            exposed = (nb[axis] < 0 or nb[axis] >= dims[axis]
+                       or not initial_voxels[nb[0], nb[1], nb[2]])
+            if not exposed:
+                continue
+
+            ua = (axis + 1) % 3
+            va = (axis + 2) % 3
+            lo = [0, 0, 0]
+            hi = [shape[0], shape[1], shape[2]]
+            lo[ua] = block_min[ua] + start
+            hi[ua] = lo[ua] + peg_size_voxels
+            lo[va] = block_min[va] + start
+            hi[va] = lo[va] + peg_size_voxels
+            if sign > 0:
+                top = block_min[axis] + SF
+                hi[axis] = top - T
+                lo[axis] = hi[axis] - d
+            else:
+                bot = block_min[axis]
+                lo[axis] = bot + T
+                hi[axis] = lo[axis] + d
+
+            lo = [max(0, int(v)) for v in lo]
+            hi = [min(int(s), int(v)) for s, v in zip(shape, hi)]
+            if lo[0] < hi[0] and lo[1] < hi[1] and lo[2] < hi[2]:
+                sl = (slice(lo[0], hi[0]), slice(lo[1], hi[1]), slice(lo[2], hi[2]))
+                base[sl] = False
+                holes[sl] = True
+
+    return base, holes
 
 
 def load_vox_to_bool_array(filepath):
@@ -65,37 +136,65 @@ def load_vox_to_bool_array(filepath):
 
 def compute_expected_layers(vox_path, scale_factor, erosion_voxels,
                             stl_voxel_size_mm=DEFAULT_STL_VOXEL_SIZE_MM,
-                            gap_mm=DEFAULT_GAP_MM):
-    """Regenerates the expected base/skin/solid voxel layers from a .vox file.
+                            gap_mm=DEFAULT_GAP_MM,
+                            peg_size_voxels=None,
+                            peg_depth_voxels=DEFAULT_PEG_DEPTH_VOXELS):
+    """Regenerates the expected base/solid voxel layers from a .vox file.
 
-    This runs the exact same scale -> surface-cutout -> erode -> crop -> align ->
-    difference pipeline used to produce the STL outputs, so callers (the generator
-    in ``main`` and the verifier) share identical math.
+    Pipeline: scale -> erode by ``erosion_voxels`` (== tile thickness T) -> carve a
+    matching square peg hole under each exposed face -> crop. The flat mitered tiles
+    themselves are generated analytically by ``tiles.generate_face_tiles`` from the
+    returned layers, so this just needs to produce the base (with holes) plus the
+    shared geometry parameters.
     """
     initial_voxel_data_bool, original_palette = load_vox_to_bool_array(vox_path)
 
     scaled_voxel_data = scale_voxels(initial_voxel_data_bool, scale_factor)
     int_sf = int(round(scale_factor))
 
-    data_for_erosion = scaled_voxel_data
-    cutout_voxels = np.zeros_like(scaled_voxel_data, dtype=bool)
+    tile_thickness_voxels = int(erosion_voxels)
+    if peg_size_voxels is None:
+        peg_size_voxels = default_peg_size_voxels(int_sf)
+    peg_size_voxels = int(peg_size_voxels)
+    peg_depth_voxels = int(peg_depth_voxels)
 
-    if initial_voxel_data_bool.any() and scaled_voxel_data.any() and int_sf > 0 and CUTOUT_SIZE > 0:
-        data_for_erosion, cutout_voxels = apply_surface_cutouts(
-            initial_voxel_data_bool, scaled_voxel_data, int_sf, CUTOUT_SIZE)
+    # Clamp peg geometry so two perpendicular pegs on the SAME voxel can never collide
+    # in the shared interior. A peg starts at depth T (the base surface) and reaches
+    # depth T + d from its face; the perpendicular peg's footprint begins at voxel
+    # offset ``start = SF//2 - p//2`` from its own face, i.e. ``SF - start - p`` from
+    # ours. Requiring T + d <= SF - start - p keeps them apart.
+    if int_sf > 0:
+        start_v = (int_sf // 2) - (peg_size_voxels // 2)
+        if start_v < tile_thickness_voxels:
+            peg_size_voxels = max(1, int_sf - 2 * tile_thickness_voxels)
+            start_v = (int_sf // 2) - (peg_size_voxels // 2)
+        max_peg_depth = (int_sf - start_v - peg_size_voxels) - tile_thickness_voxels
+        max_peg_depth = max(0, max_peg_depth)
+        if peg_depth_voxels > max_peg_depth:
+            print(f"Note: peg_depth_voxels {peg_depth_voxels} would let perpendicular pegs "
+                  f"collide; clamping to {max_peg_depth}.")
+            peg_depth_voxels = max_peg_depth
 
-    processed_eroded_uncropped = data_for_erosion
-    crop_min_coords = None
-    if erosion_voxels > 0:
-        processed_eroded_uncropped = erode_voxels(data_for_erosion, erosion_voxels)
-        if np.any(processed_eroded_uncropped):
-            base_cropped, crop_min_coords = crop_voxel_data(processed_eroded_uncropped)
-        else:
-            base_cropped = processed_eroded_uncropped
+    # Base body = eroded scaled solid (faces recede by the tile thickness T).
+    if erosion_voxels > 0 and np.any(scaled_voxel_data):
+        base_uncropped = erode_voxels(scaled_voxel_data, erosion_voxels)
     else:
-        base_cropped = data_for_erosion
+        base_uncropped = scaled_voxel_data.copy()
 
-    # Place the (possibly cropped) eroded core back into the scaled grid.
+    # Carve matching peg holes under each exposed face.
+    cutout_voxels = np.zeros_like(scaled_voxel_data, dtype=bool)
+    if np.any(base_uncropped) and int_sf > 0:
+        base_uncropped, cutout_voxels = carve_peg_holes(
+            base_uncropped, initial_voxel_data_bool, int_sf,
+            tile_thickness_voxels, peg_size_voxels, peg_depth_voxels)
+
+    crop_min_coords = None
+    if np.any(base_uncropped):
+        base_cropped, crop_min_coords = crop_voxel_data(base_uncropped)
+    else:
+        base_cropped = base_uncropped
+
+    # Place the (possibly cropped) base back into the scaled grid.
     base_aligned = np.zeros_like(scaled_voxel_data, dtype=bool)
     if np.any(base_cropped):
         if crop_min_coords is not None:
@@ -108,13 +207,8 @@ def compute_expected_layers(vox_path, scale_factor, erosion_voxels,
                     sy.start >= 0 and sy.stop <= scaled_voxel_data.shape[1] and
                     sz.start >= 0 and sz.stop <= scaled_voxel_data.shape[2]):
                 base_aligned[sx, sy, sz] = base_cropped
-            elif processed_eroded_uncropped.shape == scaled_voxel_data.shape:
-                base_aligned = processed_eroded_uncropped.copy()
-        else:
-            if base_cropped.shape == scaled_voxel_data.shape:
-                base_aligned = base_cropped.copy()
-            elif processed_eroded_uncropped.shape == scaled_voxel_data.shape:
-                base_aligned = processed_eroded_uncropped.copy()
+        elif base_cropped.shape == scaled_voxel_data.shape:
+            base_aligned = base_cropped.copy()
 
     skin = np.logical_and(scaled_voxel_data, np.logical_not(base_aligned))
 
@@ -130,6 +224,9 @@ def compute_expected_layers(vox_path, scale_factor, erosion_voxels,
         scale_factor_int=int_sf,
         voxel_size_mm=stl_voxel_size_mm,
         gap_mm=gap_mm,
+        tile_thickness_voxels=tile_thickness_voxels,
+        peg_size_voxels=int(peg_size_voxels),
+        peg_depth_voxels=int(peg_depth_voxels),
     )
 
 def scale_voxels(voxel_data_bool, scale_factor):
@@ -668,12 +765,50 @@ def save_stl_file(filepath, voxel_data_bool, output_voxel_size_mm=1.0):
     print(f"Saved hollow STL file to '{filepath}' with {num_voxels} voxels ({num_triangles} triangles representing external faces). Each voxel is {s}mm sided. STL dimensions: {dim_x_mm:.2f}mm x {dim_y_mm:.2f}mm x {dim_z_mm:.2f}mm.")
 
 
+def save_tiles_stl(filepath, tile_list, layers, gap_mm, tiles_dir=None):
+    """Write the flat mitered tiles to a combined gapped STL (and optionally one STL
+    per tile). Each tile is offset by ``sm * gap_mm`` so per-voxel groups are spread
+    apart for the exploded printable layout, matching what verify/view un-gap.
+    """
+    if not tile_list:
+        print(f"No tiles to write for '{filepath}'. Skipping.")
+        return False
+
+    SF = layers.scale_factor_int
+    S = layers.voxel_size_mm
+    placed = []
+    for i, t in enumerate(tile_list):
+        sm = np.asarray(t.voxel, dtype=float)
+        offset = sm * gap_mm
+        m = t.mesh.copy()
+        m.apply_translation(offset)
+        placed.append(m)
+
+        if tiles_dir:
+            if not os.path.exists(tiles_dir):
+                os.makedirs(tiles_dir)
+            dname = {0: "x", 1: "y", 2: "z"}[t.axis] + ("p" if t.sign > 0 else "n")
+            tile_path = os.path.join(
+                tiles_dir, f"tile_{t.voxel[0]}_{t.voxel[1]}_{t.voxel[2]}_{dname}.stl")
+            t.mesh.export(tile_path)
+
+    combined = trimesh.util.concatenate(placed)
+    combined.export(filepath)
+    print(f"Saved {len(tile_list)} tiles to '{filepath}' "
+          f"({len(combined.faces)} triangles). Gap: {gap_mm}mm." +
+          (f" Per-tile STLs in '{tiles_dir}'." if tiles_dir else ""))
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description="Scale, erode .vox files, and save as .vox and .stl.")
     parser.add_argument("input_vox_file", help="Path to the input .vox file (e.g., scene.vox).")
     parser.add_argument("--scale_factor", type=float, default=10.0, help="Factor to scale voxels by (default: 10.0).")
-    parser.add_argument("--erosion_voxels", type=int, default=1, help="Number of voxel layers to erode after scaling (default: 1).")
-    
+    parser.add_argument("--erosion_voxels", type=int, default=1, help="Voxel layers to erode = tile thickness T (default: 1).")
+    parser.add_argument("--peg_size_voxels", type=int, default=None, help="Registration peg cross-section in scaled voxels (default: ~SF/3).")
+    parser.add_argument("--peg_depth_voxels", type=int, default=DEFAULT_PEG_DEPTH_VOXELS, help=f"Registration peg depth in scaled voxels (default: {DEFAULT_PEG_DEPTH_VOXELS}).")
+    parser.add_argument("--tiles_dir", default=None, help="If set, also write one STL per tile into this directory.")
+
     args = parser.parse_args()
 
     input_path = args.input_vox_file
@@ -707,7 +842,8 @@ def main():
         # the verifier use identical math.
         layers = compute_expected_layers(
             input_path, scale_factor, erosion_amount,
-            stl_voxel_size_mm=STL_VOXEL_SIZE_MM, gap_mm=GAP_MM)
+            stl_voxel_size_mm=STL_VOXEL_SIZE_MM, gap_mm=GAP_MM,
+            peg_size_voxels=args.peg_size_voxels, peg_depth_voxels=args.peg_depth_voxels)
 
         initial_voxel_data_bool = layers.initial_voxels
         original_palette = layers.palette
@@ -741,23 +877,21 @@ def main():
         print(f"Saving processed model as .stl file to '{output_stl_path}'...")
         save_stl_file(output_stl_path, processed_voxel_data, output_voxel_size_mm=STL_VOXEL_SIZE_MM)
 
-        # Save gapped difference (skin) STL
+        # Generate the flat mitered per-face skin tiles and write the gapped STL.
         gapped_stl_saved = False
         if np.any(scaled_voxel_data):
-            if np.any(difference_voxels):
-                print(f"Saving gapped difference STL to '{output_gapped_diff_stl_path}'...")
-                gapped_stl_saved = save_gapped_difference_stl(
-                    output_gapped_diff_stl_path,
-                    initial_voxel_data_bool,
-                    difference_voxels,
-                    int_sf,
-                    STL_VOXEL_SIZE_MM,
-                    GAP_MM
-                )
+            print("Generating flat mitered per-face tiles...")
+            tile_list = tiles_mod.generate_face_tiles(layers)
+            print(f"  {len(tile_list)} tiles generated.")
+            if tile_list:
+                print(f"Saving tiles STL to '{output_gapped_diff_stl_path}'...")
+                gapped_stl_saved = save_tiles_stl(
+                    output_gapped_diff_stl_path, tile_list, layers, GAP_MM,
+                    tiles_dir=args.tiles_dir)
             else:
-                print("No voxels in boolean difference. Skipping gapped difference STL.")
+                print("No exposed faces; no tiles to save.")
         else:
-            print("Scaled voxel data is empty. Skipping gapped difference STL.")
+            print("Scaled voxel data is empty. Skipping tiles STL.")
 
         print(f"\nProcessing complete for '{input_path}'.")
         print(f"Output .vox: {output_vox_path}")

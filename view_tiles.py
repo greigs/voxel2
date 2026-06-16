@@ -1,16 +1,16 @@
-"""Interactive viewer for inspecting how the skin tiles fit over the base model.
+"""Interactive viewer for inspecting how the flat mitered skin tiles fit the base.
 
-Loads the base (``<name>_processed.stl``) and the per-voxel skin tiles
-(``<name>_gapped_diff.stl``), removes the inter-tile gap so everything sits in its
-true assembled position, and opens a PyVista window with:
+Builds the base (from ``<name>_processed.stl``) and the exact per-face tiles directly
+from ``tiles.generate_face_tiles`` (the same geometry the writer and verifier use), so
+each tile keeps its own identity for robust coloring (no merge-at-miter problem). Opens
+a PyVista window with:
 
-  * an "Explode" slider that pushes every tile radially outward from the model
-    center (0 = fully assembled / perfect fit, higher = exploded apart), and
-  * automatic highlighting (in red) of any tiles that overlap another tile or the
-    base, using the same voxel-overlap logic as ``verify_tiles.py``.
+  * an "Explode" slider that pushes every tile radially outward from the model center
+    (0 = fully assembled / perfect fit, higher = exploded apart), and
+  * automatic highlighting (in red) of any tile that overlaps another tile or the base,
+    using the same fine-grid overlap logic as ``verify_tiles.py``.
 
-Use ``--screenshot out.png --explode 0.0`` to render a single frame off-screen
-(useful on headless machines or for quick checks).
+Use ``--screenshot out.png --explode 0.0`` to render a single frame off-screen.
 """
 
 import argparse
@@ -21,78 +21,52 @@ import numpy as np
 import trimesh
 import pyvista as pv
 
-from process_vox import compute_expected_layers, DEFAULT_STL_VOXEL_SIZE_MM, DEFAULT_GAP_MM
+import tiles as tiles_mod
+from process_vox import (
+    compute_expected_layers,
+    DEFAULT_STL_VOXEL_SIZE_MM,
+    DEFAULT_GAP_MM,
+    DEFAULT_PEG_DEPTH_VOXELS,
+)
 from verify_tiles import occupied_fine_indices, scatter
 
 
-def color_for_voxel(sm):
-    """Deterministic pleasant-ish color for an original voxel coordinate."""
-    h = (int(sm[0]) * 73856093) ^ (int(sm[1]) * 19349663) ^ (int(sm[2]) * 83492791)
-    rng = np.random.default_rng(h & 0xFFFFFFFF)
-    return rng.uniform(0.30, 0.90, size=3)
-
-
-def ungap_components(gap_mesh, layers):
-    """Split the gapped skin mesh into components and translate each back to its
-    true assembled position. Returns a list of (mesh, sm_voxel) tuples."""
-    components = gap_mesh.split(only_watertight=False)
-    if len(components) == 0:
-        components = [gap_mesh]
-
-    SF = layers.scale_factor_int
-    S = layers.voxel_size_mm
-    gap = layers.gap_mm
-    pitch_block = SF * S + gap
-
-    assembled = []
-    for comp in components:
-        if comp.is_empty:
-            continue
-        sm = np.floor(np.asarray(comp.bounds[0]) / pitch_block + 1e-6).astype(int)
-        sm = np.clip(sm, 0, None)
-        a = comp.copy()
-        a.apply_translation(-sm.astype(float) * gap)
-        assembled.append((a, sm))
-    return assembled
-
-
-def detect_overlaps(assembled, base_mesh, layers, subdiv):
-    """Return a boolean list flagging which assembled tiles overlap another tile or
-    the base, plus aggregate cell counts. Uses exact center-sampling on a fine grid.
-    """
+def detect_overlaps(tile_list, base_mesh, layers, subdiv):
+    """Return a per-tile boolean list flagging tiles that overlap another tile or the
+    base, plus aggregate cell counts. Uses exact off-seam center-sampling."""
     S = layers.voxel_size_mm
     pitch = S / subdiv
     fine_shape = tuple(int(d) * subdiv for d in layers.scaled_solid.shape)
 
-    base_idx = occupied_fine_indices(base_mesh, pitch, fine_shape)
-    base_occ = scatter(base_idx, fine_shape, dtype=bool)
+    base_occ = None
+    if base_mesh is not None:
+        base_idx = occupied_fine_indices(base_mesh, pitch, fine_shape)
+        base_occ = scatter(base_idx, fine_shape, dtype=bool)
 
     tile_count = np.zeros(fine_shape, dtype=np.int32)
-    comp_indices = []
-    for a, _sm in assembled:
-        idx = occupied_fine_indices(a, pitch, fine_shape)
-        comp_indices.append(idx)
+    tile_indices = []
+    for t in tile_list:
+        idx = occupied_fine_indices(t.mesh, pitch, fine_shape)
+        tile_indices.append(idx)
         if len(idx):
             np.add.at(tile_count, tuple(idx.T), 1)
 
     overlap_cell = tile_count > 1
     flags = []
-    n_tt = 0
-    n_tb = 0
-    for idx in comp_indices:
+    for idx in tile_indices:
         if len(idx) == 0:
             flags.append(False)
             continue
         tup = tuple(idx.T)
-        hits_tt = bool(np.any(overlap_cell[tup]))
-        hits_tb = bool(np.any(base_occ[tup]))
-        n_tt += int(hits_tt)
-        n_tb += int(hits_tb)
-        flags.append(hits_tt or hits_tb)
+        hits = bool(np.any(overlap_cell[tup]))
+        if not hits and base_occ is not None:
+            hits = bool(np.any(base_occ[tup]))
+        flags.append(hits)
 
     stats = {
         "overlap_cells_tile_tile": int(np.count_nonzero(overlap_cell)),
-        "overlap_cells_tile_base": int(np.count_nonzero(base_occ & (tile_count > 0))),
+        "overlap_cells_tile_base": int(np.count_nonzero(base_occ & (tile_count > 0)))
+        if base_occ is not None else 0,
         "tiles_overlapping": int(sum(flags)),
     }
     return flags, stats
@@ -105,12 +79,13 @@ def main():
     parser.add_argument("input_vox_file", help="Path to the source .vox file.")
     parser.add_argument("--scale_factor", type=float, default=10.0)
     parser.add_argument("--erosion_voxels", type=int, default=1)
+    parser.add_argument("--peg_size_voxels", type=int, default=None)
+    parser.add_argument("--peg_depth_voxels", type=int, default=DEFAULT_PEG_DEPTH_VOXELS)
     parser.add_argument("--subdiv", type=int, default=1,
                         help="Sub-voxel resolution for overlap detection (default: 1).")
     parser.add_argument("--max_explode", type=float, default=2.0,
                         help="Maximum explosion multiplier on the slider (default: 2.0).")
     parser.add_argument("--processed_stl", default=None)
-    parser.add_argument("--gapped_stl", default=None)
     parser.add_argument("--no-base", action="store_true", help="Do not draw the base model.")
     parser.add_argument("--no-overlap-check", action="store_true",
                         help="Skip overlap detection (faster startup).")
@@ -128,44 +103,39 @@ def main():
     base_name = os.path.splitext(os.path.basename(input_path))[0]
     out_dir = os.path.dirname(input_path) or "."
     processed_path = args.processed_stl or os.path.join(out_dir, f"{base_name}_processed.stl")
-    gapped_path = args.gapped_stl or os.path.join(out_dir, f"{base_name}_gapped_diff.stl")
 
-    if not os.path.exists(gapped_path):
-        print(f"Error: gapped skin STL not found: '{gapped_path}'. Run process_vox.py first.")
-        return 2
     draw_base = not args.no_base and os.path.exists(processed_path)
     if not args.no_base and not os.path.exists(processed_path):
         print(f"Warning: base STL '{processed_path}' not found; showing tiles only.")
 
-    print(f"Regenerating layout metadata from '{input_path}'...")
+    print(f"Regenerating base + tile geometry from '{input_path}'...")
     layers = compute_expected_layers(
         input_path, args.scale_factor, args.erosion_voxels,
-        stl_voxel_size_mm=DEFAULT_STL_VOXEL_SIZE_MM, gap_mm=DEFAULT_GAP_MM)
+        stl_voxel_size_mm=DEFAULT_STL_VOXEL_SIZE_MM, gap_mm=DEFAULT_GAP_MM,
+        peg_size_voxels=args.peg_size_voxels, peg_depth_voxels=args.peg_depth_voxels)
 
     base_mesh = None
-    if draw_base or not args.no_overlap_check:
-        if os.path.exists(processed_path):
-            base_mesh = trimesh.load_mesh(processed_path)
-            crop = layers.crop_min_coords if layers.crop_min_coords is not None else (0, 0, 0)
-            base_mesh.apply_translation(np.array(crop, dtype=float) * layers.voxel_size_mm)
+    if (draw_base or not args.no_overlap_check) and os.path.exists(processed_path):
+        base_mesh = trimesh.load_mesh(processed_path)
+        crop = layers.crop_min_coords if layers.crop_min_coords is not None else (0, 0, 0)
+        base_mesh.apply_translation(np.array(crop, dtype=float) * layers.voxel_size_mm)
 
-    print(f"Loading and un-gapping tiles from '{gapped_path}'...")
-    gap_mesh = trimesh.load_mesh(gapped_path)
-    assembled = ungap_components(gap_mesh, layers)
-    print(f"  {len(assembled)} tile components.")
+    print("Generating flat mitered tiles...")
+    tile_list = tiles_mod.generate_face_tiles(layers)
+    print(f"  {len(tile_list)} tiles.")
+    if not tile_list:
+        print("No tiles to show.")
+        return 2
 
-    flags = [False] * len(assembled)
-    if not args.no_overlap_check and base_mesh is not None:
+    flags = [False] * len(tile_list)
+    if not args.no_overlap_check:
         print(f"Detecting overlaps (subdiv={args.subdiv})...")
-        flags, stats = detect_overlaps(assembled, base_mesh, layers, args.subdiv)
+        flags, stats = detect_overlaps(tile_list, base_mesh, layers, args.subdiv)
         print(f"  {stats['tiles_overlapping']} tiles overlap another tile or the base.")
 
-    # Model center for radial explosion (use the assembled bounding box center).
-    all_lo = []
-    all_hi = []
-    for a, _ in assembled:
-        all_lo.append(a.bounds[0])
-        all_hi.append(a.bounds[1])
+    # Model center for radial explosion.
+    all_lo = [t.mesh.bounds[0] for t in tile_list]
+    all_hi = [t.mesh.bounds[1] for t in tile_list]
     if base_mesh is not None:
         all_lo.append(base_mesh.bounds[0])
         all_hi.append(base_mesh.bounds[1])
@@ -177,21 +147,17 @@ def main():
     plotter = pv.Plotter(off_screen=off_screen)
     plotter.set_background("white")
 
+    base_actor = None
     if draw_base and base_mesh is not None:
         base_actor = plotter.add_mesh(pv.wrap(base_mesh), color=(0.75, 0.75, 0.78),
                                       name="base", opacity=1.0)
-    else:
-        base_actor = None
 
     n_overlap = int(sum(flags))
     tile_actors = []  # (actor, direction_vector)
-    for i, (a, sm) in enumerate(assembled):
-        direction = np.asarray(a.centroid) - center
-        if flags[i]:
-            color = (0.90, 0.10, 0.10)
-        else:
-            color = color_for_voxel(sm)
-        actor = plotter.add_mesh(pv.wrap(a), color=color, name=f"tile_{i}")
+    for i, t in enumerate(tile_list):
+        direction = np.asarray(t.mesh.centroid) - center
+        color = (0.90, 0.10, 0.10) if flags[i] else tuple(tiles_mod.tile_color(t))
+        actor = plotter.add_mesh(pv.wrap(t.mesh), color=color, name=f"tile_{i}")
         tile_actors.append((actor, direction))
 
     def set_explode(value):
@@ -199,7 +165,7 @@ def main():
             actor.SetPosition(*(direction * value))
 
     title_lines = [
-        f"{len(assembled)} tiles | {n_overlap} overlapping (red)",
+        f"{len(tile_list)} tiles | {n_overlap} overlapping (red)",
         "Slider: Explode (0 = assembled)",
     ]
     plotter.add_text("\n".join(title_lines), font_size=10, color="black", name="hud")
@@ -209,7 +175,6 @@ def main():
             set_explode, [0.0, args.max_explode], value=0.0, title="Explode",
             pointa=(0.30, 0.92), pointb=(0.70, 0.92),
         )
-
         if base_actor is not None:
             def toggle_base(state):
                 base_actor.SetVisibility(bool(state))

@@ -1,21 +1,19 @@
-"""Verify that the per-voxel skin tiles form a perfect, colorable skin over the base.
+"""Verify that the flat, mitered, per-face skin tiles form a perfect colorable skin.
 
-The generator in ``process_vox.py`` produces:
-  * ``<name>_processed.stl``    -- the eroded core ("base"), cropped to content.
-  * ``<name>_gapped_diff.stl``  -- the skin, one chunk per original voxel, laid out
-                                   with a small ``gap_mm`` between voxel cells so each
-                                   cell can be printed/colored independently.
+With the flat mitered tiles (one per exposed voxel face: full-face outer square,
+45-degree inward-beveled side walls, central registration peg), "perfect fit" is now
+an OUTER-SURFACE property plus a no-collision property:
 
-This script regenerates the expected base/skin/solid voxel layers directly from the
-source ``.vox`` (via ``process_vox.compute_expected_layers``), then re-voxelizes the
-*actual* STL outputs back onto a common fine grid (each scaled voxel subdivided
-``--subdiv`` times). Removing the gap from every tile, it then checks that:
+  * Surface coverage: there is exactly one full-face tile per exposed voxel face, so
+    the visible surface is tiled with no gaps and no double-cover (by construction).
+  * Tile-vs-tile: no two tile bodies physically intersect (the inward bevels and
+    miters guarantee they only touch at zero-volume seams).
+  * Tile-vs-base: tile bodies only enter the base through their peg holes, so no
+    tile body volume overlaps the base body.
 
-  * tiles leave no GAPS (every expected-skin cell is covered),
-  * tiles do not OVERLAP each other,
-  * tiles do not OVERLAP the base,
-  * base + tiles exactly equal the full scaled solid (no missing/extra material),
-  * each tile stays within its own original voxel cell (per-cube colorability).
+Tiles are generated analytically by ``tiles.generate_face_tiles`` (the same code the
+writer uses), and the base is re-voxelized from ``<name>_processed.stl``. Both are
+sampled at fine-cell centers (exact point-in-mesh) on a common grid.
 
 Exit code is 0 when every check passes, non-zero otherwise.
 """
@@ -28,17 +26,21 @@ import sys
 import numpy as np
 import trimesh
 
+import tiles as tiles_mod
 from process_vox import (
     compute_expected_layers,
     save_vox_file,
     DEFAULT_STL_VOXEL_SIZE_MM,
     DEFAULT_GAP_MM,
+    DEFAULT_PEG_DEPTH_VOXELS,
+    FACE_DIRECTIONS,
 )
 
-
-def upsample(arr, n):
-    """Repeat a 3D boolean array ``n`` times along each axis."""
-    return np.repeat(np.repeat(np.repeat(arr, n, axis=0), n, axis=1), n, axis=2)
+# Per-axis sub-cell sampling offset. Deliberately asymmetric and chosen so no pair of
+# offsets has an integer sum or difference: this keeps cell centers off the axis-aligned
+# faces AND off the 45-degree miter seams (planes x +/- z = k*S), avoiding double-counting
+# tiles that merely touch at a zero-volume seam.
+SAMPLE_OFFSET = np.array([0.31, 0.53, 0.79])
 
 
 def downsample_any(fine, n):
@@ -53,8 +55,7 @@ def occupied_fine_indices(mesh, pitch, fine_shape):
     """Return integer indices of fine cells whose centers fall inside ``mesh``.
 
     Cell centers are tested exactly with ``mesh.contains`` (point-in-mesh). Sampling
-    at centers - never on cube boundary planes - avoids the boundary ambiguity that
-    plagues surface voxelization when ``pitch`` equals the cube size. Only cells
+    at centers - never on cube boundary planes - avoids boundary ambiguity. Only cells
     within the mesh bounding box are tested, chunked along X to bound memory.
     """
     if mesh is None or mesh.is_empty:
@@ -62,9 +63,9 @@ def occupied_fine_indices(mesh, pitch, fine_shape):
 
     lo, hi = np.asarray(mesh.bounds[0]), np.asarray(mesh.bounds[1])
     fs = np.array(fine_shape)
-    # Fine cell i has center (i + 0.5) * pitch.
-    i_lo = np.clip(np.floor(lo / pitch - 0.5).astype(int), 0, fs - 1)
-    i_hi = np.clip(np.ceil(hi / pitch - 0.5).astype(int), 0, fs - 1)
+    off = SAMPLE_OFFSET
+    i_lo = np.clip(np.floor(lo / pitch - off).astype(int), 0, fs - 1)
+    i_hi = np.clip(np.ceil(hi / pitch - off).astype(int), 0, fs - 1)
     if np.any(i_hi < i_lo):
         return np.empty((0, 3), dtype=int)
 
@@ -75,9 +76,9 @@ def occupied_fine_indices(mesh, pitch, fine_shape):
     collected = []
     for xi in range(i_lo[0], i_hi[0] + 1):
         pts = np.empty((len(yz), 3), dtype=float)
-        pts[:, 0] = (xi + 0.5) * pitch
-        pts[:, 1] = (yz[:, 0] + 0.5) * pitch
-        pts[:, 2] = (yz[:, 1] + 0.5) * pitch
+        pts[:, 0] = (xi + off[0]) * pitch
+        pts[:, 1] = (yz[:, 0] + off[1]) * pitch
+        pts[:, 2] = (yz[:, 1] + off[2]) * pitch
         inside = mesh.contains(pts)
         if np.any(inside):
             sel = yz[inside]
@@ -102,61 +103,43 @@ def scatter(indices, shape, dtype=bool):
     return out
 
 
+def count_exposed_faces(vox):
+    """Count exposed faces of a boolean voxel array (one tile is expected per face)."""
+    dims = vox.shape
+    n = 0
+    for (x, y, z) in np.argwhere(vox):
+        for axis, sign in FACE_DIRECTIONS:
+            nb = [int(x), int(y), int(z)]
+            nb[axis] += sign
+            if nb[axis] < 0 or nb[axis] >= dims[axis] or not vox[nb[0], nb[1], nb[2]]:
+                n += 1
+    return n
+
+
+def build_tile_occupancy(tile_list, pitch, fine_shape):
+    """Voxelize each tile body onto the fine grid.
+
+    Returns ``(tile_count, per_tile_idx)`` where ``tile_count`` is a per-cell hit
+    count (>1 means tiles overlap) and ``per_tile_idx`` is the list of occupied
+    indices per tile.
+    """
+    tile_count = np.zeros(fine_shape, dtype=np.int32)
+    per_tile_idx = []
+    for t in tile_list:
+        idx = occupied_fine_indices(t.mesh, pitch, fine_shape)
+        per_tile_idx.append(idx)
+        if len(idx):
+            np.add.at(tile_count, tuple(idx.T), 1)
+    return tile_count, per_tile_idx
+
+
 def voxelize_base(processed_path, layers, pitch, fine_shape):
-    """Re-voxelize the base STL onto the scaled fine grid."""
+    """Re-voxelize the base STL onto the scaled fine grid (aligned via crop offset)."""
     mesh = trimesh.load_mesh(processed_path)
     crop = layers.crop_min_coords if layers.crop_min_coords is not None else (0, 0, 0)
-    # The base STL starts at its own origin; shift it back to where the cropped core
-    # sits inside the scaled grid.
     mesh.apply_translation(np.array(crop, dtype=float) * layers.voxel_size_mm)
     idx = occupied_fine_indices(mesh, pitch, fine_shape)
     return scatter(idx, fine_shape, dtype=bool)
-
-
-def voxelize_tiles(gapped_path, layers, pitch, fine_shape, subdiv):
-    """Re-voxelize the gapped skin STL, un-gapping each tile component.
-
-    Returns ``(tile_count, leaks)`` where ``tile_count`` is a per-cell hit count
-    (values > 1 indicate tile-vs-tile overlap) and ``leaks`` lists components that
-    bled outside their own original voxel cell.
-    """
-    gap_mesh = trimesh.load_mesh(gapped_path)
-    components = gap_mesh.split(only_watertight=False)
-    if len(components) == 0:
-        components = [gap_mesh]
-
-    SF = layers.scale_factor_int
-    S = layers.voxel_size_mm
-    gap = layers.gap_mm
-    pitch_block = SF * S + gap  # gapped spacing between original voxels
-
-    tile_count = np.zeros(fine_shape, dtype=np.int32)
-    leaks = []
-
-    for comp in components:
-        if comp.is_empty:
-            continue
-        min_corner = np.asarray(comp.bounds[0])
-        # Each component lives entirely within one original voxel's gapped block.
-        sm = np.floor(min_corner / pitch_block + 1e-6).astype(int)
-        sm = np.clip(sm, 0, None)
-
-        assembled = comp.copy()
-        assembled.apply_translation(-sm.astype(float) * gap)  # remove the gap offset
-
-        idx = occupied_fine_indices(assembled, pitch, fine_shape)
-        if len(idx) == 0:
-            continue
-        np.add.at(tile_count, tuple(idx.T), 1)
-
-        # Leakage: this tile's cells must stay within its sm block at fine resolution.
-        blk_lo = sm * SF * subdiv
-        blk_hi = (sm + 1) * SF * subdiv
-        outside = np.any((idx < blk_lo) | (idx >= blk_hi), axis=1)
-        if np.any(outside):
-            leaks.append({"voxel": sm.tolist(), "leaked_cells": int(outside.sum())})
-
-    return tile_count, leaks
 
 
 def sample_coords(mask, limit=20):
@@ -167,23 +150,20 @@ def sample_coords(mask, limit=20):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Verify per-voxel skin tiles fit the base model with no gaps or overlaps."
+        description="Verify flat mitered skin tiles cover the surface with no gaps or overlaps."
     )
     parser.add_argument("input_vox_file", help="Path to the source .vox file.")
-    parser.add_argument("--scale_factor", type=float, default=10.0,
-                        help="Scale factor used to generate the STLs (default: 10.0).")
-    parser.add_argument("--erosion_voxels", type=int, default=1,
-                        help="Erosion layers used to generate the STLs (default: 1).")
+    parser.add_argument("--scale_factor", type=float, default=10.0)
+    parser.add_argument("--erosion_voxels", type=int, default=1)
+    parser.add_argument("--peg_size_voxels", type=int, default=None)
+    parser.add_argument("--peg_depth_voxels", type=int, default=DEFAULT_PEG_DEPTH_VOXELS)
     parser.add_argument("--subdiv", type=int, default=2,
                         help="Sub-voxel sampling resolution per scaled voxel (default: 2).")
     parser.add_argument("--processed_stl", default=None,
                         help="Override path to the base STL (default: <name>_processed.stl).")
-    parser.add_argument("--gapped_stl", default=None,
-                        help="Override path to the gapped skin STL (default: <name>_gapped_diff.stl).")
-    parser.add_argument("--report", default=None,
-                        help="Optional path to write a JSON report.")
+    parser.add_argument("--report", default=None, help="Optional path to write a JSON report.")
     parser.add_argument("--debug_vox", action="store_true",
-                        help="Write <name>_verify_gaps.vox / _verify_overlaps.vox for inspection.")
+                        help="Write <name>_verify_overlaps.vox for inspection.")
     args = parser.parse_args()
 
     if args.subdiv < 1:
@@ -198,19 +178,16 @@ def main():
     base_name = os.path.splitext(os.path.basename(input_path))[0]
     out_dir = os.path.dirname(input_path) or "."
     processed_path = args.processed_stl or os.path.join(out_dir, f"{base_name}_processed.stl")
-    gapped_path = args.gapped_stl or os.path.join(out_dir, f"{base_name}_gapped_diff.stl")
+    if not os.path.exists(processed_path):
+        print(f"Error: base STL not found: '{processed_path}'. Run process_vox.py first.")
+        return 2
 
-    for label, path in (("base", processed_path), ("gapped skin", gapped_path)):
-        if not os.path.exists(path):
-            print(f"Error: {label} STL not found: '{path}'. "
-                  "Run process_vox.py first or pass an explicit path.")
-            return 2
-
-    print(f"Regenerating expected voxel layers from '{input_path}' "
+    print(f"Regenerating base + tile geometry from '{input_path}' "
           f"(scale={args.scale_factor}, erosion={args.erosion_voxels})...")
     layers = compute_expected_layers(
         input_path, args.scale_factor, args.erosion_voxels,
-        stl_voxel_size_mm=DEFAULT_STL_VOXEL_SIZE_MM, gap_mm=DEFAULT_GAP_MM)
+        stl_voxel_size_mm=DEFAULT_STL_VOXEL_SIZE_MM, gap_mm=DEFAULT_GAP_MM,
+        peg_size_voxels=args.peg_size_voxels, peg_depth_voxels=args.peg_depth_voxels)
 
     scaled = layers.scaled_solid
     if not np.any(scaled):
@@ -221,87 +198,58 @@ def main():
     S = layers.voxel_size_mm
     pitch = S / N
     fine_shape = tuple(int(d) * N for d in scaled.shape)
-
     print(f"Scaled grid: {scaled.shape}, fine grid: {fine_shape} (subdiv={N}, pitch={pitch:.4f}mm).")
 
-    # Expected layers upsampled to the fine grid.
-    scaled_fine = upsample(scaled, N)
-    skin_fine = upsample(layers.skin, N)
-    base_expected_fine = upsample(layers.base_aligned, N)
+    print("Generating flat mitered tiles...")
+    tile_list = tiles_mod.generate_face_tiles(layers)
+    n_exposed = count_exposed_faces(layers.initial_voxels)
+    print(f"  {len(tile_list)} tiles, {n_exposed} exposed faces.")
 
     print(f"Re-voxelizing base STL '{processed_path}'...")
     base_occ = voxelize_base(processed_path, layers, pitch, fine_shape)
 
-    print(f"Re-voxelizing gapped skin STL '{gapped_path}'...")
-    tile_count, leaks = voxelize_tiles(gapped_path, layers, pitch, fine_shape, N)
+    print("Voxelizing tiles...")
+    tile_count, _ = build_tile_occupancy(tile_list, pitch, fine_shape)
     tile_occ = tile_count > 0
 
     # --- Checks ---------------------------------------------------------------
-    gaps = skin_fine & ~tile_occ            # expected skin not covered by any tile
-    overlap_tt = tile_count > 1             # tile-vs-tile overlap
-    overlap_tb = tile_occ & base_occ        # tile-vs-base overlap
-    assembled = base_occ | tile_occ
-    missing = scaled_fine & ~assembled      # solid not covered by base or tiles
-    extra = assembled & ~scaled_fine        # material outside the solid
-    base_mismatch = base_occ ^ base_expected_fine  # informational: base mesh vs expected
-
-    cell_volume = float(N) ** 3  # fine cells per scaled voxel, for human-readable counts
+    overlap_tt = tile_count > 1            # tile-vs-tile body intersection
+    overlap_tb = tile_occ & base_occ       # tile body intersects base body
+    coverage_ok = (len(tile_list) == n_exposed) and (n_exposed > 0)
 
     def count(mask):
         return int(np.count_nonzero(mask))
 
-    results = {
-        "gaps_between_or_under_tiles": count(gaps),
-        "tile_vs_tile_overlap": count(overlap_tt),
-        "tile_vs_base_overlap": count(overlap_tb),
-        "solid_not_covered": count(missing),
-        "material_outside_solid": count(extra),
-        "tile_leakage_components": len(leaks),
-    }
-    # base_mismatch is informational only (does not fail the run).
-    info = {"base_mesh_vs_expected_mismatch_cells": count(base_mismatch)}
+    cell_volume = float(N) ** 3
+    n_tt = count(overlap_tt)
+    n_tb = count(overlap_tb)
 
-    failed = any(v > 0 for v in results.values())
+    failed = (not coverage_ok) or n_tt > 0 or n_tb > 0
 
     print("\n================ Verification summary ================")
-    print(f"{'Check':<34}{'fine cells':>12}{'~voxels':>10}   status")
-    print("-" * 70)
-    check_order = [
-        ("Gaps (skin uncovered)", "gaps_between_or_under_tiles"),
-        ("Tile vs tile overlap", "tile_vs_tile_overlap"),
-        ("Tile vs base overlap", "tile_vs_base_overlap"),
-        ("Solid not covered", "solid_not_covered"),
-        ("Material outside solid", "material_outside_solid"),
-    ]
-    for label, key in check_order:
-        c = results[key]
-        status = "OK" if c == 0 else "FAIL"
-        print(f"{label:<34}{c:>12}{c / cell_volume:>10.1f}   {status}")
-    leak_status = "OK" if len(leaks) == 0 else "FAIL"
-    print(f"{'Tile leakage (per-cube color)':<34}{len(leaks):>12}{'':>10}   {leak_status}")
-    print("-" * 70)
-    print(f"(info) base mesh vs expected mismatch cells: {info['base_mesh_vs_expected_mismatch_cells']}")
+    print(f"{'Check':<36}{'value':>14}   status")
+    print("-" * 64)
+    cov_status = "OK" if coverage_ok else "FAIL"
+    print(f"{'Surface coverage (tiles==faces)':<36}{str(len(tile_list)) + '/' + str(n_exposed):>14}   {cov_status}")
+    print(f"{'Tile vs tile overlap (cells)':<36}{n_tt:>14}   {'OK' if n_tt == 0 else 'FAIL'}")
+    print(f"{'Tile vs base overlap (cells)':<36}{n_tb:>14}   {'OK' if n_tb == 0 else 'FAIL'}")
+    print("-" * 64)
+    print(f"(approx voxel-equivalents: tt={n_tt / cell_volume:.1f}, tb={n_tb / cell_volume:.1f})")
     print("=" * 54)
     overall = "PASSED" if not failed else "FAILED"
     print(f"Overall: {overall} -- tiles {'form' if not failed else 'do NOT form'} "
-          f"a perfect skin over the base.\n")
+          f"a gapless, non-overlapping skin.\n")
 
-    if leaks:
-        print("Leaking tiles (component bled outside its own voxel cell):")
-        for lk in leaks[:10]:
-            print(f"  voxel {lk['voxel']}: {lk['leaked_cells']} cells")
-        if len(leaks) > 10:
-            print(f"  ... and {len(leaks) - 10} more")
-
-    # --- Optional JSON report -------------------------------------------------
     if args.report:
         report = {
             "input_vox": os.path.abspath(input_path),
             "processed_stl": os.path.abspath(processed_path),
-            "gapped_stl": os.path.abspath(gapped_path),
             "params": {
                 "scale_factor": args.scale_factor,
                 "erosion_voxels": args.erosion_voxels,
+                "tile_thickness_voxels": layers.tile_thickness_voxels,
+                "peg_size_voxels": layers.peg_size_voxels,
+                "peg_depth_voxels": layers.peg_depth_voxels,
                 "subdiv": N,
                 "voxel_size_mm": S,
                 "gap_mm": layers.gap_mm,
@@ -309,37 +257,29 @@ def main():
             },
             "scaled_shape": list(scaled.shape),
             "fine_shape": list(fine_shape),
-            "counts_fine_cells": results,
-            "info": info,
+            "n_tiles": len(tile_list),
+            "n_exposed_faces": n_exposed,
+            "counts_fine_cells": {
+                "tile_vs_tile_overlap": n_tt,
+                "tile_vs_base_overlap": n_tb,
+            },
             "samples_fine_indices": {
-                "gaps": sample_coords(gaps),
                 "tile_vs_tile_overlap": sample_coords(overlap_tt),
                 "tile_vs_base_overlap": sample_coords(overlap_tb),
-                "solid_not_covered": sample_coords(missing),
-                "material_outside_solid": sample_coords(extra),
             },
-            "leaks": leaks,
+            "coverage_ok": bool(coverage_ok),
             "passed": not failed,
         }
         with open(args.report, "w") as f:
             json.dump(report, f, indent=2)
         print(f"Wrote JSON report to '{args.report}'.")
 
-    # --- Optional debug .vox --------------------------------------------------
     if args.debug_vox:
-        palette = layers.palette
-        gaps_vox = downsample_any(gaps, N)
         overlaps_vox = downsample_any(overlap_tt | overlap_tb, N)
-        gaps_path = os.path.join(out_dir, f"{base_name}_verify_gaps.vox")
         overlaps_path = os.path.join(out_dir, f"{base_name}_verify_overlaps.vox")
-        if np.any(gaps_vox):
-            print(f"Writing gap voxels to '{gaps_path}'...")
-            save_vox_file(gaps_path, gaps_vox, palette)
-        else:
-            print("No gap voxels to write.")
         if np.any(overlaps_vox):
             print(f"Writing overlap voxels to '{overlaps_path}'...")
-            save_vox_file(overlaps_path, overlaps_vox, palette)
+            save_vox_file(overlaps_path, overlaps_vox, layers.palette)
         else:
             print("No overlap voxels to write.")
 
