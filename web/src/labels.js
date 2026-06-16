@@ -8,7 +8,7 @@
 import opentype from "opentype.js";
 import polygonClipping from "polygon-clipping";
 import earcut from "earcut";
-import { Mesh, add, scale } from "./mesh.js";
+import { Mesh, add, scale, cross, dot } from "./mesh.js";
 
 let FONT = null;
 
@@ -314,6 +314,14 @@ export function applyLabel(body, textfill, C, uhat, vhat, w, L, emboss) {
 
   try {
     if (!textfill || !textfill.length) { closeOuterFace(); return null; }
+
+    // For faces whose (uhat, vhat) basis is left-handed relative to the outward normal
+    // (every negative-facing face), the glyphs would read mirrored when viewed from
+    // outside. Mirror the text in u so it reads correctly; the body pocket and number are
+    // both built from this same polygon, so they stay watertight and aligned.
+    if (dot(cross(uhat, vhat), n) < 0) {
+      textfill = textfill.map((poly) => poly.map((ring) => ring.map(([x, y]) => [-x, y])));
+    }
 
     // Normalized text fill: each polygon = [digitOuter(CCW), counter(CW), ...].
     // Everything below is built from these exact rings so the body lid, pocket walls and
