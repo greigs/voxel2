@@ -45,6 +45,8 @@ class ExpectedLayers(NamedTuple):
     tile_thickness_voxels: int             # T: bevel depth / skin thickness (scaled voxels)
     peg_size_voxels: int                   # p: peg cross-section (scaled voxels)
     peg_depth_voxels: int                  # d: peg depth (scaled voxels)
+    voxel_color_code: np.ndarray           # per-(original)-voxel paint color-code (0 empty)
+    color_legend: dict                     # color-code -> source palette index
 
 
 def carve_peg_holes(base_uncropped, initial_voxels, scale_factor_int,
@@ -105,14 +107,17 @@ def carve_peg_holes(base_uncropped, initial_voxels, scale_factor_int,
     return base, holes
 
 
-def load_vox_to_bool_array(filepath):
-    """Loads the first model of a .vox file into a (bool array, palette) pair."""
+def load_vox_full(filepath):
+    """Loads the first model of a .vox file into ``(bool array, color_index array, palette)``.
+
+    ``color_index`` has the same shape as the bool array; cells hold the source palette
+    index (0 where empty)."""
     vox_data_container = VoxParser(filepath).parse()
 
     if not vox_data_container.models:
         print(f"Input .vox file '{filepath}' contains no models. Treating as empty (0,0,0).")
         palette = vox_data_container.palette or [(128, 128, 128, 255)]
-        return np.zeros((0, 0, 0), dtype=bool), palette
+        return np.zeros((0, 0, 0), dtype=bool), np.zeros((0, 0, 0), dtype=np.int32), palette
 
     model = vox_data_container.models[0]
     model_size = model.size
@@ -123,15 +128,54 @@ def load_vox_to_bool_array(filepath):
                          "Expected 3 non-negative integers.")
 
     voxel_data_bool = np.zeros(model_size, dtype=bool)
+    color_index = np.zeros(model_size, dtype=np.int32)
     if model.voxels:
-        for x, y, z, _color_index in model.voxels:
+        for x, y, z, c_index in model.voxels:
             if 0 <= x < model_size[0] and 0 <= y < model_size[1] and 0 <= z < model_size[2]:
                 voxel_data_bool[x, y, z] = True
+                color_index[x, y, z] = int(c_index)
             else:
                 print(f"Warning: Voxel at ({x},{y},{z}) is outside the defined model size {model_size}. Skipping.")
 
     palette = vox_data_container.palette or [(128, 128, 128, 255)]
+    return voxel_data_bool, color_index, palette
+
+
+def load_vox_to_bool_array(filepath):
+    """Loads the first model of a .vox file into a (bool array, palette) pair."""
+    voxel_data_bool, _color_index, palette = load_vox_full(filepath)
     return voxel_data_bool, palette
+
+
+def _palette_rgb(palette, index):
+    """Best-effort lookup of an (r,g,b) 0-255 tuple for a MagicaVoxel palette index."""
+    if not palette:
+        return (180, 180, 180)
+    # MagicaVoxel color indices are 1-based into a 256-entry palette.
+    for cand in (index - 1, index):
+        if 0 <= cand < len(palette):
+            entry = palette[cand]
+            try:
+                return (int(entry[0]), int(entry[1]), int(entry[2]))
+            except Exception:
+                break
+    return (180, 180, 180)
+
+
+def build_color_codes(color_index, solid_mask):
+    """Map the distinct palette indices used by solid voxels to compact codes 1..K.
+
+    Returns ``(code_array, legend)`` where ``code_array`` matches the input shape
+    (0 = empty) and ``legend`` maps code -> source palette index."""
+    code_array = np.zeros(color_index.shape, dtype=np.int32)
+    if not np.any(solid_mask):
+        return code_array, {}
+    used = sorted({int(v) for v in np.unique(color_index[solid_mask])})
+    idx_to_code = {idx: i + 1 for i, idx in enumerate(used)}
+    legend = {code: idx for idx, code in idx_to_code.items()}
+    for idx, code in idx_to_code.items():
+        code_array[solid_mask & (color_index == idx)] = code
+    return code_array, legend
 
 
 def compute_expected_layers(vox_path, scale_factor, erosion_voxels,
@@ -147,7 +191,9 @@ def compute_expected_layers(vox_path, scale_factor, erosion_voxels,
     returned layers, so this just needs to produce the base (with holes) plus the
     shared geometry parameters.
     """
-    initial_voxel_data_bool, original_palette = load_vox_to_bool_array(vox_path)
+    initial_voxel_data_bool, initial_color_index, original_palette = load_vox_full(vox_path)
+    voxel_color_code, color_legend = build_color_codes(
+        initial_color_index, initial_voxel_data_bool)
 
     scaled_voxel_data = scale_voxels(initial_voxel_data_bool, scale_factor)
     int_sf = int(round(scale_factor))
@@ -227,6 +273,8 @@ def compute_expected_layers(vox_path, scale_factor, erosion_voxels,
         tile_thickness_voxels=tile_thickness_voxels,
         peg_size_voxels=int(peg_size_voxels),
         peg_depth_voxels=int(peg_depth_voxels),
+        voxel_color_code=voxel_color_code,
+        color_legend=color_legend,
     )
 
 def scale_voxels(voxel_data_bool, scale_factor):
@@ -765,39 +813,113 @@ def save_stl_file(filepath, voxel_data_bool, output_voxel_size_mm=1.0):
     print(f"Saved hollow STL file to '{filepath}' with {num_voxels} voxels ({num_triangles} triangles representing external faces). Each voxel is {s}mm sided. STL dimensions: {dim_x_mm:.2f}mm x {dim_y_mm:.2f}mm x {dim_z_mm:.2f}mm.")
 
 
-def save_tiles_stl(filepath, tile_list, layers, gap_mm, tiles_dir=None):
-    """Write the flat mitered tiles to a combined gapped STL (and optionally one STL
-    per tile). Each tile is offset by ``sm * gap_mm`` so per-voxel groups are spread
-    apart for the exploded printable layout, matching what verify/view un-gap.
+def _dir_name(axis, sign):
+    return {0: "x", 1: "y", 2: "z"}[axis] + ("p" if sign > 0 else "n")
+
+
+def save_tiles_stl(filepath, tile_list, layers, gap_mm, tiles_dir=None,
+                   numbers_path=None, manifest_path=None):
+    """Write the flat mitered tiles to a combined gapped STL.
+
+    Each tile is offset by ``sm * gap_mm`` so per-voxel groups are spread apart for the
+    exploded printable layout (matching what verify/view un-gap). If tiles carry number
+    inlays, the inlays are written (aligned, same gap) to ``numbers_path`` for a second
+    AMS filament, and a CSV ``manifest_path`` maps each number to its location/color.
+    Per-tile STLs (body + number) are dumped to ``tiles_dir`` when given.
     """
     if not tile_list:
         print(f"No tiles to write for '{filepath}'. Skipping.")
         return False
 
-    SF = layers.scale_factor_int
-    S = layers.voxel_size_mm
-    placed = []
-    for i, t in enumerate(tile_list):
-        sm = np.asarray(t.voxel, dtype=float)
-        offset = sm * gap_mm
-        m = t.mesh.copy()
-        m.apply_translation(offset)
-        placed.append(m)
+    placed_bodies = []
+    placed_numbers = []
+    manifest_rows = []
+    have_numbers = any(t.number_mesh is not None for t in tile_list)
+
+    if tiles_dir and not os.path.exists(tiles_dir):
+        os.makedirs(tiles_dir)
+
+    for t in tile_list:
+        offset = np.asarray(t.voxel, dtype=float) * gap_mm
+        body = t.mesh.copy()
+        body.apply_translation(offset)
+        placed_bodies.append(body)
+
+        num = None
+        if t.number_mesh is not None:
+            num = t.number_mesh.copy()
+            num.apply_translation(offset)
+            placed_numbers.append(num)
+
+        manifest_rows.append((t.number, t.voxel[0], t.voxel[1], t.voxel[2],
+                              _dir_name(t.axis, t.sign), t.color_code))
 
         if tiles_dir:
-            if not os.path.exists(tiles_dir):
-                os.makedirs(tiles_dir)
-            dname = {0: "x", 1: "y", 2: "z"}[t.axis] + ("p" if t.sign > 0 else "n")
-            tile_path = os.path.join(
-                tiles_dir, f"tile_{t.voxel[0]}_{t.voxel[1]}_{t.voxel[2]}_{dname}.stl")
-            t.mesh.export(tile_path)
+            stem = f"tile_{t.number:04d}_{t.voxel[0]}_{t.voxel[1]}_{t.voxel[2]}_{_dir_name(t.axis, t.sign)}"
+            t.mesh.export(os.path.join(tiles_dir, stem + "_body.stl"))
+            if t.number_mesh is not None:
+                t.number_mesh.export(os.path.join(tiles_dir, stem + "_number.stl"))
 
-    combined = trimesh.util.concatenate(placed)
-    combined.export(filepath)
-    print(f"Saved {len(tile_list)} tiles to '{filepath}' "
-          f"({len(combined.faces)} triangles). Gap: {gap_mm}mm." +
+    trimesh.util.concatenate(placed_bodies).export(filepath)
+    print(f"Saved {len(tile_list)} tile bodies to '{filepath}'. Gap: {gap_mm}mm." +
           (f" Per-tile STLs in '{tiles_dir}'." if tiles_dir else ""))
+
+    if have_numbers and numbers_path and placed_numbers:
+        trimesh.util.concatenate(placed_numbers).export(numbers_path)
+        print(f"Saved {len(placed_numbers)} number inlays to '{numbers_path}' "
+              "(print in the AMS text color).")
+
+    if manifest_path:
+        import csv
+        with open(manifest_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["number", "voxel_x", "voxel_y", "voxel_z", "face", "color_code"])
+            w.writerows(manifest_rows)
+        print(f"Wrote tile manifest to '{manifest_path}'.")
+
     return True
+
+
+def save_color_legend(layers, json_path, png_path=None):
+    """Write the color-code legend (code -> source color) as JSON and an optional PNG.
+
+    The PNG is a swatch chart so you can match each color-code to a real paint."""
+    legend = layers.color_legend or {}
+    palette = layers.palette
+    rows = []
+    for code in sorted(legend):
+        rgb = _palette_rgb(palette, legend[code])
+        rows.append({"color_code": int(code), "palette_index": int(legend[code]),
+                     "rgb": list(rgb), "hex": "#%02X%02X%02X" % rgb})
+
+    import json as _json
+    with open(json_path, "w") as f:
+        _json.dump({"colors": rows}, f, indent=2)
+    print(f"Wrote color legend to '{json_path}' ({len(rows)} colors).")
+
+    if png_path and rows:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            n = len(rows)
+            fig, ax = plt.subplots(figsize=(3.2, 0.5 * n + 0.6))
+            for i, r in enumerate(rows):
+                y = n - 1 - i
+                ax.add_patch(plt.Rectangle((0, y), 1, 0.85,
+                                           color=tuple(c / 255.0 for c in r["rgb"])))
+                ax.text(1.2, y + 0.42, f"code {r['color_code']}  {r['hex']}",
+                        va="center", fontsize=10)
+            ax.set_xlim(0, 4)
+            ax.set_ylim(0, n)
+            ax.axis("off")
+            ax.set_title("Tile paint color codes")
+            fig.tight_layout()
+            fig.savefig(png_path, dpi=150)
+            plt.close(fig)
+            print(f"Wrote color legend image to '{png_path}'.")
+        except Exception as e:
+            print(f"Could not write legend PNG ({e}).")
 
 
 def main():
@@ -807,7 +929,9 @@ def main():
     parser.add_argument("--erosion_voxels", type=int, default=1, help="Voxel layers to erode = tile thickness T (default: 1).")
     parser.add_argument("--peg_size_voxels", type=int, default=None, help="Registration peg cross-section in scaled voxels (default: ~SF/3).")
     parser.add_argument("--peg_depth_voxels", type=int, default=DEFAULT_PEG_DEPTH_VOXELS, help=f"Registration peg depth in scaled voxels (default: {DEFAULT_PEG_DEPTH_VOXELS}).")
-    parser.add_argument("--tiles_dir", default=None, help="If set, also write one STL per tile into this directory.")
+    parser.add_argument("--tiles_dir", default=None, help="If set, also write one STL per tile (body + number) into this directory.")
+    parser.add_argument("--no_numbers", action="store_true", help="Disable the flat two-color number inlays on tiles.")
+    parser.add_argument("--emboss_depth_mm", type=float, default=tiles_mod.DEFAULT_EMBOSS_DEPTH_MM, help=f"Depth of the flush number inlay layer in mm (default: {tiles_mod.DEFAULT_EMBOSS_DEPTH_MM}).")
 
     args = parser.parse_args()
 
@@ -832,6 +956,10 @@ def main():
     output_scaled_vox_path = os.path.join(output_dir, f"{base_name}_scaled.vox") # New path for scaled .vox
     output_scaled_stl_path = os.path.join(output_dir, f"{base_name}_scaled.stl") # New path for scaled .stl
     output_gapped_diff_stl_path = os.path.join(output_dir, f"{base_name}_gapped_diff.stl") # New path
+    output_numbers_stl_path = os.path.join(output_dir, f"{base_name}_numbers.stl")
+    output_manifest_path = os.path.join(output_dir, f"{base_name}_tiles_manifest.csv")
+    output_legend_json_path = os.path.join(output_dir, f"{base_name}_color_legend.json")
+    output_legend_png_path = os.path.join(output_dir, f"{base_name}_color_legend.png")
 
     STL_VOXEL_SIZE_MM = DEFAULT_STL_VOXEL_SIZE_MM
     GAP_MM = DEFAULT_GAP_MM # Gap for the new gapped difference STL
@@ -879,15 +1007,21 @@ def main():
 
         # Generate the flat mitered per-face skin tiles and write the gapped STL.
         gapped_stl_saved = False
+        with_labels = not args.no_numbers
         if np.any(scaled_voxel_data):
-            print("Generating flat mitered per-face tiles...")
-            tile_list = tiles_mod.generate_face_tiles(layers)
+            print(f"Generating flat mitered per-face tiles{' with number inlays' if with_labels else ''}...")
+            tile_list = tiles_mod.generate_face_tiles(
+                layers, with_labels=with_labels, emboss_depth_mm=args.emboss_depth_mm)
             print(f"  {len(tile_list)} tiles generated.")
             if tile_list:
                 print(f"Saving tiles STL to '{output_gapped_diff_stl_path}'...")
                 gapped_stl_saved = save_tiles_stl(
                     output_gapped_diff_stl_path, tile_list, layers, GAP_MM,
-                    tiles_dir=args.tiles_dir)
+                    tiles_dir=args.tiles_dir,
+                    numbers_path=output_numbers_stl_path if with_labels else None,
+                    manifest_path=output_manifest_path)
+                if with_labels:
+                    save_color_legend(layers, output_legend_json_path, output_legend_png_path)
             else:
                 print("No exposed faces; no tiles to save.")
         else:

@@ -87,6 +87,10 @@ def main():
                         help="Maximum explosion multiplier on the slider (default: 2.0).")
     parser.add_argument("--processed_stl", default=None)
     parser.add_argument("--no-base", action="store_true", help="Do not draw the base model.")
+    parser.add_argument("--no_numbers", action="store_true",
+                        help="Do not build/show the flat number inlays.")
+    parser.add_argument("--number_color", default="black",
+                        help="Color for the number inlays (default: black).")
     parser.add_argument("--no-overlap-check", action="store_true",
                         help="Skip overlap detection (faster startup).")
     parser.add_argument("--screenshot", default=None,
@@ -120,8 +124,9 @@ def main():
         crop = layers.crop_min_coords if layers.crop_min_coords is not None else (0, 0, 0)
         base_mesh.apply_translation(np.array(crop, dtype=float) * layers.voxel_size_mm)
 
-    print("Generating flat mitered tiles...")
-    tile_list = tiles_mod.generate_face_tiles(layers)
+    with_labels = not args.no_numbers
+    print(f"Generating flat mitered tiles{' with number inlays' if with_labels else ''}...")
+    tile_list = tiles_mod.generate_face_tiles(layers, with_labels=with_labels)
     print(f"  {len(tile_list)} tiles.")
     if not tile_list:
         print("No tiles to show.")
@@ -159,6 +164,10 @@ def main():
         color = (0.90, 0.10, 0.10) if flags[i] else tuple(tiles_mod.tile_color(t))
         actor = plotter.add_mesh(pv.wrap(t.mesh), color=color, name=f"tile_{i}")
         tile_actors.append((actor, direction))
+        if t.number_mesh is not None:
+            num_actor = plotter.add_mesh(pv.wrap(t.number_mesh), color=args.number_color,
+                                         name=f"num_{i}")
+            tile_actors.append((num_actor, direction))
 
     def set_explode(value):
         for actor, direction in tile_actors:

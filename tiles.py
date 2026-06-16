@@ -36,6 +36,12 @@ class Tile:
     voxel: Tuple[int, int, int]
     axis: int   # face normal axis (0=x, 1=y, 2=z)
     sign: int   # +1 or -1
+    number: int = 0                      # unique assembly id written on the face
+    color_code: int = 0                  # paint color-code written on the face
+    number_mesh: "trimesh.Trimesh" = None  # flush two-color inlay (None if unlabeled)
+
+
+DEFAULT_EMBOSS_DEPTH_MM = 0.6  # depth of the flush two-color number inlay
 
 
 # The 6 face directions as (axis, sign).
@@ -148,12 +154,18 @@ def build_face_tile(C, uhat, vhat, w, L, T, peg_u0, peg_v0, peg_size, peg_depth)
     return mesh
 
 
-def generate_face_tiles(layers, params: TileParams = None) -> List[Tile]:
+def generate_face_tiles(layers, params: TileParams = None,
+                        with_labels: bool = False,
+                        emboss_depth_mm: float = DEFAULT_EMBOSS_DEPTH_MM) -> List[Tile]:
     """Generate one tile per exposed face of every surface voxel.
 
     Iterates ``layers.initial_voxels`` (the original, unscaled solid). A face is
     exposed when the neighboring original voxel is empty or out of bounds. Output
     ordering is deterministic so all callers reproduce identical tiles.
+
+    When ``with_labels`` is True, each tile gets a unique assembly number and a paint
+    color-code written flush on its outer face (a two-color inlay), and ``tile.mesh``
+    is the tile body with the number cavity removed.
     """
     if params is None:
         params = params_from_layers(layers)
@@ -163,6 +175,11 @@ def generate_face_tiles(layers, params: TileParams = None) -> List[Tile]:
     S = float(layers.voxel_size_mm)
     if SF <= 0 or not np.any(vox):
         return []
+
+    color_code_of = getattr(layers, "voxel_color_code", None)
+    label_mod = None
+    if with_labels:
+        import tile_labels as label_mod
 
     L = SF * S
     T = params.tile_thickness_voxels * S
@@ -184,8 +201,10 @@ def generate_face_tiles(layers, params: TileParams = None) -> List[Tile]:
 
     dims = vox.shape
     tiles: List[Tile] = []
+    next_number = 1
     for (x, y, z) in np.argwhere(vox):
         block_min = np.array([x, y, z], dtype=float) * SF * S
+        cc = int(color_code_of[x, y, z]) if color_code_of is not None else 0
         for axis, sign in FACE_DIRECTIONS:
             nb = [int(x), int(y), int(z)]
             nb[axis] += sign
@@ -207,6 +226,16 @@ def generate_face_tiles(layers, params: TileParams = None) -> List[Tile]:
 
             mesh = build_face_tile(C, uhat, vhat, w, L, T, peg_off, peg_off,
                                    peg_size, peg_depth)
-            tiles.append(Tile(mesh=mesh, voxel=(int(x), int(y), int(z)),
-                              axis=axis, sign=sign))
+            tile = Tile(mesh=mesh, voxel=(int(x), int(y), int(z)),
+                        axis=axis, sign=sign, number=next_number, color_code=cc)
+            next_number += 1
+
+            if label_mod is not None:
+                poly = label_mod.label_polygon([tile.number, tile.color_code], L)
+                body, number_mesh = label_mod.apply_label(
+                    mesh, poly, C, uhat, vhat, w, L, emboss_depth_mm)
+                tile.mesh = body
+                tile.number_mesh = number_mesh
+
+            tiles.append(tile)
     return tiles
