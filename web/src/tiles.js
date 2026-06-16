@@ -16,8 +16,8 @@ export const DEFAULT_TILE_CLEARANCE_MM = 0.1;
 // Crush-rib defaults: thin triangular ridges on each peg face that locally interfere with
 // the base hole and deform on insertion, giving a consistent snug fit across orientations.
 export const DEFAULT_PEG_RIB_COUNT = 1;       // ribs per peg face (0 disables)
-export const DEFAULT_PEG_RIB_HEIGHT_MM = 0.25; // how far each rib protrudes past the peg face
-export const DEFAULT_PEG_RIB_WIDTH_MM = 0.6;   // base width of each triangular rib
+export const DEFAULT_PEG_RIB_HEIGHT_MM = 0.2; // how far each rib protrudes past the peg face
+export const DEFAULT_PEG_RIB_WIDTH_MM = 1;    // base width of each triangular rib
 
 // Deterministic pleasant-ish RGB [0..1] per tile face (mirrors tiles.tile_color intent).
 export function tileColor(tile) {
