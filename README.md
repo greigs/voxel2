@@ -8,7 +8,7 @@ The repo includes a few sample `.vox` models (`test.vox`, `pug.vox`, `scene.vox`
 
 ## Web tool
 
-Live site: `https://greigs.github.io/voxel-paint-by-numbers/` (published by the GitHub Actions workflow on push).
+Live site: <https://greigs.github.io/voxel-paint-by-numbers/> (published by the GitHub Actions workflow on push).
 
 It is a static Vite app (vanilla JS + three.js):
 
